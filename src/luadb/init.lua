@@ -38,7 +38,6 @@ function luadb.open(config)
     })
     db.replicator = rep
     exec.replicator = rep
-
     function db:exec(sql, params)
         local ast, parse_err = parser.parse(sql, params)
         if not ast then
@@ -46,10 +45,13 @@ function luadb.open(config)
         end
         local res, err = self.executor:execute(ast)
         if res and self.replicator and not self.replicator.is_replicating then
-            self.replicator:broadcast(sql)
+            self.replicator:broadcast(sql, nil, res)
         end
         return res, err
     end
+
+    -- Automatically restore persisted replication conflict versions across restarts
+    rep:load_persistent_state()
 
     -- Streaming Coroutine Cursor Iterator
     function db:cursor(sql, params)
@@ -101,10 +103,16 @@ function luadb.open(config)
     end
 
     function db:commit()
+        if self.replicator then
+            self.replicator:flush_tx_pending()
+        end
         return self:exec("COMMIT;")
     end
 
     function db:rollback()
+        if self.replicator then
+            self.replicator:discard_tx_pending()
+        end
         return self:exec("ROLLBACK;")
     end
 
@@ -118,6 +126,9 @@ function luadb.open(config)
     end
 
     function db:close()
+        if self.replicator then
+            self.replicator:persist_state()
+        end
         self.wal:commit()
         if self.file then
             self.file:close()

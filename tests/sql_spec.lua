@@ -14,23 +14,24 @@ print("\n--------------------------------------------------")
 print("[TEST SUITE] SQL Parser, Query Executor & CRUD")
 print("--------------------------------------------------")
 
-local db = luadb.open({ driver = "memory", storage_path = "test_crud.db" })
+os.remove("sql_spec_clean.db")
+local db = luadb.open({ driver = "memory", storage_path = "sql_spec_clean.db" })
 
 -- 1. CREATE TABLE
 print("\n[SQL Test 1] CREATE TABLE Statement")
-print("  > SQL: CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
-local res1 = db:exec("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
-assert_eq(res1.message, "Table created: employees", "Catalog Table Creation")
+print("  > SQL: CREATE TABLE sql_employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
+local res1 = db:exec("CREATE TABLE sql_employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
+assert_eq(res1.message, "Table created: sql_employees", "Catalog Table Creation")
 
 -- 2. CREATE INDEX
 print("\n[SQL Test 2] CREATE INDEX Statement")
-print("  > SQL: CREATE INDEX idx_emp_salary ON employees (salary);")
-local res_idx = db:exec("CREATE INDEX idx_emp_salary ON employees (salary);")
+print("  > SQL: CREATE INDEX idx_emp_salary ON sql_employees (salary);")
+local res_idx = db:exec("CREATE INDEX idx_emp_salary ON sql_employees (salary);")
 assert_eq(res_idx.message, "Index created: idx_emp_salary", "Secondary B+Tree Index Creation")
 
 -- 3. INSERT INTO with Prepared Statements
 print("\n[SQL Test 3] INSERT INTO Statements & Prepared Statements")
-local stmt = db:prepare("INSERT INTO employees VALUES (?, ?, ?, ?);")
+local stmt = db:prepare("INSERT INTO sql_employees VALUES (?, ?, ?, ?);")
 stmt:exec(1, "Alice", 90000, "Engineering")
 stmt:exec(2, "Bob", 75000, "Design")
 stmt:exec(3, "Charlie", 110000, "Engineering")
@@ -38,8 +39,8 @@ print("  ✓ [OK] Prepared Statement Execution with Parameter Binding")
 
 -- 4. SELECT with WHERE & ORDER BY & LIMIT
 print("\n[SQL Test 4] SELECT Query Execution")
-print("  > SQL: SELECT name, salary FROM employees WHERE role = 'Engineering' ORDER BY salary DESC;")
-local res_select = db:exec("SELECT name, salary FROM employees WHERE role = 'Engineering' ORDER BY salary DESC;")
+print("  > SQL: SELECT name, salary FROM sql_employees WHERE role = 'Engineering' ORDER BY salary DESC;")
+local res_select = db:exec("SELECT name, salary FROM sql_employees WHERE role = 'Engineering' ORDER BY salary DESC;")
 print(string.format("  > Returned %d records", #res_select))
 for idx, row in ipairs(res_select) do
     print(string.format("    Row %d: name='%s', salary=%.2f", idx, row.name, row.salary))
@@ -50,44 +51,44 @@ assert_eq(res_select[2].name, "Alice", "Second Row Name")
 
 -- 5. SQL Aggregate Functions
 print("\n[SQL Test 5] SQL Aggregate Functions (COUNT, SUM, AVG, MAX)")
-local res_cnt = db:exec("SELECT COUNT(*) FROM employees;")
+local res_cnt = db:exec("SELECT COUNT(*) FROM sql_employees;")
 assert_eq(res_cnt[1].count_star, 3, "Aggregate COUNT(*)")
 
-local res_sum = db:exec("SELECT SUM(salary) FROM employees;")
+local res_sum = db:exec("SELECT SUM(salary) FROM sql_employees;")
 assert_eq(res_sum[1].sum_salary, 275000, "Aggregate SUM(salary)")
 
-local res_max = db:exec("SELECT MAX(salary) FROM employees;")
+local res_max = db:exec("SELECT MAX(salary) FROM sql_employees;")
 assert_eq(res_max[1].max_salary, 110000, "Aggregate MAX(salary)")
 
 -- 6. LIKE Operator Matching
 print("\n[SQL Test 6] LIKE Wildcard Pattern Matching")
-local res_like = db:exec("SELECT name FROM employees WHERE name LIKE 'A%';")
+local res_like = db:exec("SELECT name FROM sql_employees WHERE name LIKE 'A%';")
 assert_eq(#res_like, 1, "LIKE 'A%' matching count")
 assert_eq(res_like[1].name, "Alice", "LIKE matching name")
 
 -- 7. UPDATE
 print("\n[SQL Test 7] UPDATE Statement")
-print("  > SQL: UPDATE employees SET salary = 95000 WHERE name = 'Alice';")
-db:exec("UPDATE employees SET salary = 95000 WHERE name = 'Alice';")
-local res_up = db:exec("SELECT salary FROM employees WHERE name = 'Alice';")
+print("  > SQL: UPDATE sql_employees SET salary = 95000 WHERE name = 'Alice';")
+db:exec("UPDATE sql_employees SET salary = 95000 WHERE name = 'Alice';")
+local res_up = db:exec("SELECT salary FROM sql_employees WHERE name = 'Alice';")
 assert_eq(res_up[1].salary, 95000, "Updated Salary Verification")
 
 -- 8. DELETE
 print("\n[SQL Test 8] DELETE Statement")
-print("  > SQL: DELETE FROM employees WHERE name = 'Bob';")
-db:exec("DELETE FROM employees WHERE name = 'Bob';")
-local res_del = db:exec("SELECT * FROM employees;")
+print("  > SQL: DELETE FROM sql_employees WHERE name = 'Bob';")
+db:exec("DELETE FROM sql_employees WHERE name = 'Bob';")
+local res_del = db:exec("SELECT * FROM sql_employees;")
 assert_eq(#res_del, 2, "Remaining Record Count after Delete")
 
 -- 9. TRANSACTIONS & ROLLBACK
 print("\n[SQL Test 9] Write-Ahead Logging Transactions & ROLLBACK")
 print("  > SQL: BEGIN TRANSACTION;")
 db:begin()
-print("  > SQL: INSERT INTO employees VALUES (4, 'Dave', 60000, 'Marketing');")
-db:exec("INSERT INTO employees VALUES (4, 'Dave', 60000, 'Marketing');")
+print("  > SQL: INSERT INTO sql_employees VALUES (4, 'Dave', 60000, 'Marketing');")
+db:exec("INSERT INTO sql_employees VALUES (4, 'Dave', 60000, 'Marketing');")
 print("  > SQL: ROLLBACK;")
 db:rollback()
-local res_trans = db:exec("SELECT * FROM employees WHERE name = 'Dave';")
+local res_trans = db:exec("SELECT * FROM sql_employees WHERE name = 'Dave';")
 assert_eq(#res_trans, 0, "Uncommitted Record Absence Verification")
 
 -- 10. TIMESTAMP & TEMPORAL DATA TYPES
@@ -97,6 +98,69 @@ db:exec("INSERT INTO events VALUES (1, 'System Launch', '2026-08-15 00:30:00', '
 local res_ts = db:exec("SELECT title, created_at FROM events WHERE id = 1;")
 assert_eq(#res_ts, 1, "Timestamp Query Row Count")
 assert_eq(res_ts[1].created_at, "2026-08-15 00:30:00", "Timestamp Column Value")
+
+-- 11. COUNT(column) vs COUNT(*) NULL SEMANTICS
+print("\n[SQL Test 11] COUNT(col) Excludes NULLs while COUNT(*) Counts All Rows")
+db:exec("CREATE TABLE count_test (id INT PRIMARY KEY, val REAL);")
+db:exec("INSERT INTO count_test VALUES (1, 100.0);")
+db:exec("INSERT INTO count_test VALUES (2, NULL);")
+local res_cstar = db:exec("SELECT COUNT(*) FROM count_test;")
+local res_ccol  = db:exec("SELECT COUNT(val) FROM count_test;")
+assert_eq(res_cstar[1].count_star, 2, "COUNT(*) includes NULL row")
+assert_eq(res_ccol[1].count_val,   1, "COUNT(val) excludes NULL row")
+
+-- 12. GROUP BY NULL vs EMPTY STRING SEPARATION
+print("\n[SQL Test 12] GROUP BY Distinguishes NULL from Empty String ('')")
+db:exec("CREATE TABLE null_str_test (id INT PRIMARY KEY, code TEXT);")
+db:exec("INSERT INTO null_str_test VALUES (1, NULL);")
+db:exec("INSERT INTO null_str_test VALUES (2, '');")
+db:exec("INSERT INTO null_str_test VALUES (3, 'A');")
+local res_gb = db:exec("SELECT code, COUNT(*) FROM null_str_test GROUP BY code ORDER BY code;")
+assert_eq(#res_gb, 3, "GROUP BY produces 3 distinct groups (NULL, '', 'A')")
+
+-- 13. ORDER BY INVALID COLUMN ERROR HANDLING
+print("\n[SQL Test 13] ORDER BY Unknown Column Error")
+local _, err_ord = db:exec("SELECT name FROM sql_employees ORDER BY non_existent_col;")
+assert_eq(err_ord ~= nil, true, "ORDER BY invalid column returns error")
+
+-- 14. GROUP BY INVALID COLUMN ERROR HANDLING
+print("\n[SQL Test 14] GROUP BY Unknown Column Error")
+local _, err_gb = db:exec("SELECT name FROM sql_employees GROUP BY non_existent_col;")
+assert_eq(err_gb ~= nil, true, "GROUP BY invalid column returns error")
+
+-- 16. ADVERSARIAL AGGREGATES WITH NEGATIVE NUMBERS, NULL, AND ZERO
+print("\n[SQL Test 16] Adversarial Aggregates (Negative Numbers, NULL, Zero)")
+db:exec("CREATE TABLE adv_agg_test (id INT PRIMARY KEY, val REAL);")
+db:exec("INSERT INTO adv_agg_test VALUES (1, 10.0);")
+db:exec("INSERT INTO adv_agg_test VALUES (2, -5.0);")
+db:exec("INSERT INTO adv_agg_test VALUES (3, NULL);")
+db:exec("INSERT INTO adv_agg_test VALUES (4, 0.0);")
+db:exec("INSERT INTO adv_agg_test VALUES (5, -15.0);")
+
+local r_cstar = db:exec("SELECT COUNT(*) FROM adv_agg_test;")
+local r_ccol  = db:exec("SELECT COUNT(val) FROM adv_agg_test;")
+local r_sum   = db:exec("SELECT SUM(val) FROM adv_agg_test;")
+local r_avg   = db:exec("SELECT AVG(val) FROM adv_agg_test;")
+local r_min   = db:exec("SELECT MIN(val) FROM adv_agg_test;")
+local r_max   = db:exec("SELECT MAX(val) FROM adv_agg_test;")
+
+assert_eq(r_cstar[1].count_star, 5, "Adversarial COUNT(*) = 5")
+assert_eq(r_ccol[1].count_val,   4, "Adversarial COUNT(val) = 4 (excludes NULL)")
+assert_eq(r_sum[1].sum_val,   -10.0, "Adversarial SUM(val) = -10.0")
+assert_eq(r_avg[1].avg_val,    -2.5, "Adversarial AVG(val) = -2.5")
+assert_eq(r_min[1].min_val,   -15.0, "Adversarial MIN(val) = -15.0")
+assert_eq(r_max[1].max_val,    10.0, "Adversarial MAX(val) = 10.0")
+
+
+-- 17. ADVERSARIAL GROUP BY WITH NULL, EMPTY STRING, ZERO, AND FALSE
+print("\n[SQL Test 17] Adversarial GROUP BY (NULL, '', 0, FALSE)")
+db:exec("CREATE TABLE adv_gb_test (id INT PRIMARY KEY, v_text TEXT, v_num INT);")
+db:exec("INSERT INTO adv_gb_test VALUES (1, NULL, 0);")
+db:exec("INSERT INTO adv_gb_test VALUES (2, '', 0);")
+db:exec("INSERT INTO adv_gb_test VALUES (3, '0', 0);")
+db:exec("INSERT INTO adv_gb_test VALUES (4, '0', 1);")
+local res_adv_gb = db:exec("SELECT v_text, v_num, COUNT(*) FROM adv_gb_test GROUP BY v_text, v_num;")
+assert_eq(#res_adv_gb, 4, "Adversarial GROUP BY produces 4 distinct typed groups")
 
 db:close()
 

@@ -36,19 +36,51 @@ function proto.parse_msg(pkt)
     }, rest
 end
 
-function proto.serialize_replicate(tx_id, origin_node, ts, sql)
-    return string.format("%s\n%s\n%d\n%s", tostring(tx_id), tostring(origin_node), math.floor(ts or os.time()), tostring(sql))
+function proto.serialize_replicate(tx_id, origin_node, ts, sql, table_name, pk_val)
+    local t_name = table_name or ""
+    local pk = pk_val ~= nil and tostring(pk_val) or ""
+    local ts_str = ""
+    if type(ts) == "table" then
+        ts_str = string.format("%.0f:%.0f", tonumber(ts.pt) or 0, tonumber(ts.lc) or 0)
+    else
+        ts_str = tostring(ts or 0)
+    end
+    return string.format("%s\n%s\n%s\n%s\n%s\n%s", tostring(tx_id), tostring(origin_node), ts_str, tostring(t_name), tostring(pk), tostring(sql))
 end
 
 function proto.deserialize_replicate(payload)
-    local tx_id, origin_node, ts_str, sql = payload:match("^([^\n]+)\n([^\n]+)\n(%d+)\n(.*)$")
-    if not tx_id then return nil end
-    return {
-        tx_id = tx_id,
-        origin_node = origin_node,
-        timestamp = tonumber(ts_str),
-        sql = sql
-    }
+    if not payload then return nil end
+    local tx_id, origin_node, ts_str, t_name, pk_val, sql = payload:match("^([^\n]+)\n([^\n]+)\n([^\n]+)\n([^\n]*)\n([^\n]*)\n(.*)$")
+    if tx_id then
+        local pt, lc = ts_str:match("^([%d%.]+):([%d%.]+)$")
+        local hlc_val
+        if pt then
+            hlc_val = { pt = tonumber(pt) or 0, lc = tonumber(lc) or 0 }
+        else
+            hlc_val = { pt = tonumber(ts_str) or 0, lc = 0 }
+        end
+        return {
+            tx_id = tx_id,
+            origin_node = origin_node,
+            timestamp = hlc_val,
+            table_name = t_name ~= "" and t_name or nil,
+            pk_val = pk_val ~= "" and pk_val or nil,
+            sql = sql
+        }
+    end
+    -- Fallback for legacy format
+    local l_tx, l_node, l_ts, l_sql = payload:match("^([^\n]+)\n([^\n]+)\n(%d+)\n(.*)$")
+    if l_tx then
+        return {
+            tx_id = l_tx,
+            origin_node = l_node,
+            timestamp = { pt = tonumber(l_ts) or 0, lc = 0 },
+            table_name = nil,
+            pk_val = nil,
+            sql = l_sql
+        }
+    end
+    return nil
 end
 
 return proto
