@@ -20,8 +20,18 @@ function parser._parse_tokens(tokens, sql, params)
     local p_idx = 1
     for i, t in ipairs(tokens) do
         if t.type == "PARAM" then
-            local val = (params and params[p_idx]) or "luadb"
+            local val = nil
+            local has_param = false
+            if params and p_idx <= #params then
+                val = params[p_idx]
+                has_param = true
+            end
             p_idx = p_idx + 1
+
+            if not has_param then
+                val = "luadb"
+            end
+
             if type(val) == "number" then
                 tokens[i] = { type = "NUMBER", value = val }
             elseif type(val) == "boolean" then

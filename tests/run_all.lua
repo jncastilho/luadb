@@ -1,7 +1,10 @@
 print("==================================================")
 print("  LuaDB Complete RDBMS Verification Suite (Verbose)  ")
 print("==================================================")
-
+-- Clean up any leftover temporary database files from previous runs
+for _, db_file in ipairs({ "temp_test.db", "employees.db", "json_test.db", "bugfix.db", "fk_test.db", "adv_test.db", "example_local.db", "reindex_test.db", "standalone_node.db", "cloud_database.db", "kamailio_cdr.db", "test_crud.db" }) do
+    os.remove(db_file)
+end
 dofile("tests/vfs_spec.lua")
 dofile("tests/storage_spec.lua")
 dofile("tests/sql_spec.lua")

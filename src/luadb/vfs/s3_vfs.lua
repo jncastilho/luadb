@@ -28,20 +28,28 @@ function S3VFS:_http_request(method, path, headers, body)
     for k, v in pairs(headers) do
         table.insert(cmd, string.format('-H "%s: %s"', k, v))
     end
+    local tmp_file_path = nil
     if body and #body > 0 then
-        -- Handle body via temporary file or inline data
-        table.insert(cmd, string.format('--data-binary "%s"', body:gsub('"', '\\"')))
+        tmp_file_path = os.tmpname()
+        local f = io.open(tmp_file_path, "wb")
+        if f then
+            f:write(body)
+            f:close()
+            table.insert(cmd, string.format('--data-binary "@%s"', tmp_file_path))
+        end
     end
     table.insert(cmd, string.format('"%s%s"', self.endpoint, path))
 
     local exec_cmd = table.concat(cmd, " ")
     local handle = io.popen(exec_cmd)
     if not handle then
+        if tmp_file_path then os.remove(tmp_file_path) end
         return nil, 500, "Failed to execute curl command"
     end
 
     local response = handle:read("*a")
     handle:close()
+    if tmp_file_path then os.remove(tmp_file_path) end
 
     local header_part, body_part = response:match("^(.-)\r?\n\r?\n(.*)$")
     if not header_part then

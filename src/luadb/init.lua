@@ -13,7 +13,7 @@ function luadb.open(config)
     local driver_type = config.driver or "local"
     local storage_path = config.storage_path or "luadb.db"
 
-    local vfs = vfs_factory.create(driver_type, config.s3 or { base_dir = config.base_dir or "." })
+    local vfs = vfs_factory.create(driver_type, config.s3 or config)
     local file_obj, err = vfs:open(storage_path, "r+b")
     if not file_obj then
         error("LuaDB failed to open storage: " .. tostring(err))
