@@ -108,6 +108,15 @@ function luadb.open(config)
         return self:exec("ROLLBACK;")
     end
 
+    function db:recover()
+        return self.wal:recover()
+    end
+
+    function db:gc()
+        collectgarbage("collect")
+        return collectgarbage("count")
+    end
+
     function db:close()
         self.wal:commit()
         if self.file then

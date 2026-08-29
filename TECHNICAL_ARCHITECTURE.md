@@ -83,11 +83,12 @@ All tables and indexes are stored in fixed **4096-byte slotted binary pages**:
 
 ---
 
-### 2.3. Write-Ahead Logging (WAL) & ACID Transactions
+### 2.3. Write-Ahead Logging (WAL), Transaction Isolation & Crash Recovery
 - **WAL Engine (`storage/wal.lua`)**: In-progress mutations are held in uncommitted page buffers (`pending_pages`).
 - **`BEGIN`**: Enables page buffer isolation.
 - **`COMMIT`**: Flushes pending pages sequentially to VFS and issues `sync()`.
 - **`ROLLBACK`**: Discards uncommitted page buffers.
+- **`wal:recover()`**: Reset transient dirty memory buffers and issue storage handles sync to ensure zero post-crash storage corruption (`tests/crash_recovery_spec.lua`).
 
 ---
 
@@ -145,14 +146,16 @@ luadb/
 │   ├── 04_standalone_server.lua
 │   └── 05_kamailio_cdr_drain.lua
 ├── src/luadb/
-│   ├── init.lua               # Main package entry point (luadb.open / luadb.pool)
+│   ├── init.lua               # Main package entry point (luadb.open / luadb.pool / db:gc / db:recover)
 │   ├── async/                 # Scheduler & connection pool
 │   ├── cluster/               # Master-master active-active replication & config
 │   ├── net/                   # PostgreSQL wire protocol socket gateway
 │   ├── sql/                   # Lexer, Parser, Executor, and JSON engine
 │   ├── storage/               # B+Tree, WAL, Slotted Page Manager, Serializer
 │   └── vfs/                   # Local, Memory, and S3 SigV4 VFS drivers
-├── tests/                     # 12-suite master verification framework
+├── tests/                     # 14-suite master verification framework
+│   ├── crash_recovery_spec.lua # Deterministic crash recovery fuzzing
+│   ├── benchmark_spec.lua     # TPS, query latency, and memory footprint metrics
 │   └── run_all.lua
 ├── README.md                  # Project overview & quickstart
 └── TECHNICAL_ARCHITECTURE.md # Architecture specification

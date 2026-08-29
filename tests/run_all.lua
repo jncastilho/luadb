@@ -16,6 +16,8 @@ dofile("tests/json_spec.lua")
 dofile("tests/foreign_key_spec.lua")
 dofile("tests/advanced_features_spec.lua")
 dofile("tests/bugfixes_spec.lua")
+dofile("tests/crash_recovery_spec.lua")
+dofile("tests/benchmark_spec.lua")
 dofile("tests/examples_spec.lua")
 
 print("\n==================================================")
