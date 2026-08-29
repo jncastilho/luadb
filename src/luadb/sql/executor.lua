@@ -635,6 +635,14 @@ function executor:execute(ast)
 
         -- GROUP BY path
         if ast.group_by and #ast.group_by > 0 then
+            local function make_group_key_part(v)
+                if v == nil then return "N" end
+                local t = type(v)
+                if t == "number" then return "I:" .. tostring(v)
+                elseif t == "boolean" then return "B:" .. (v and "1" or "0")
+                else return "S:" .. tostring(v) end
+            end
+
             local groups = {}    -- key -> { rows }
             local group_keys = {} -- ordered list of group key strings
             for _, row in ipairs(filtered) do
@@ -642,12 +650,12 @@ function executor:execute(ast)
                 for _, gb_col in ipairs(ast.group_by) do
                     for idx, col in ipairs(meta.columns) do
                         if col.name:lower() == gb_col:lower() then
-                            table.insert(key_parts, tostring(row[idx] or ""))
+                            table.insert(key_parts, make_group_key_part(row[idx]))
                             break
                         end
                     end
                 end
-                local gkey = table.concat(key_parts, "|")
+                local gkey = table.concat(key_parts, "\29") -- ASCII Group Separator \29
                 if not groups[gkey] then
                     groups[gkey] = { rows = {}, key_vals = {} }
                     table.insert(group_keys, gkey)
@@ -676,7 +684,20 @@ function executor:execute(ast)
                         local col_name = proj.column
                         local res_val = 0
                         if func == "COUNT" then
-                            res_val = #g.rows
+                            if col_name == "*" then
+                                res_val = #g.rows
+                            else
+                                local cnt = 0
+                                for _, r in ipairs(g.rows) do
+                                    for idx, c in ipairs(meta.columns) do
+                                        if c.name:lower() == col_name:lower() and r[idx] ~= nil then
+                                            cnt = cnt + 1
+                                            break
+                                        end
+                                    end
+                                end
+                                res_val = cnt
+                            end
                         elseif func == "SUM" or func == "AVG" then
                             local sum, count = 0, 0
                             for _, r in ipairs(g.rows) do
@@ -747,7 +768,20 @@ function executor:execute(ast)
                 local res_val = 0
 
                 if func == "COUNT" then
-                    res_val = #filtered
+                    if col_name == "*" then
+                        res_val = #filtered
+                    else
+                        local cnt = 0
+                        for _, r in ipairs(filtered) do
+                            for idx, c in ipairs(meta.columns) do
+                                if c.name:lower() == col_name:lower() and r[idx] ~= nil then
+                                    cnt = cnt + 1
+                                    break
+                                end
+                            end
+                        end
+                        res_val = cnt
+                    end
                 elseif func == "SUM" or func == "AVG" then
                     local sum = 0
                     local count = 0
@@ -790,11 +824,22 @@ function executor:execute(ast)
             for idx, col in ipairs(meta.columns) do
                 col_idx_map[col.name:lower()] = idx
             end
+
+            -- Validate all ORDER BY columns exist in schema
+            for _, ob in ipairs(sort_cols) do
+                local cname = ob.column:lower()
+                local cnum = tonumber(cname)
+                if not cnum and not col_idx_map[cname] then
+                    return nil, "Column not found: " .. ob.column
+                end
+            end
+
             table.sort(filtered, function(ra, rb)
                 for _, ob in ipairs(sort_cols) do
                     local col_name = ob.column:lower()
+                    local col_num  = tonumber(col_name)
                     local desc     = (ob.direction == "DESC")
-                    local cidx     = col_idx_map[col_name]
+                    local cidx     = col_num or col_idx_map[col_name]
                     local a_val = cidx and ra[cidx] or nil
                     local b_val = cidx and rb[cidx] or nil
                     if a_val ~= b_val then

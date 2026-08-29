@@ -18,8 +18,36 @@ package.path = "src/?.lua;src/?/init.lua;" .. package.path
 -- We pipe SQL to sqlite3 using io.popen and parse CSV output.
 -- No LuaDB code is involved at all in the Oracle path.
 
-local SQLITE_BIN = "/usr/bin/sqlite3"
-local SQLITE_DB  = "/tmp/luadb_darkroom_oracle.db"
+local function find_sqlite_bin()
+    local env_bin = os.getenv("SQLITE_BIN")
+    local candidates = env_bin and { env_bin } or { "sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/opt/homebrew/bin/sqlite3" }
+    for _, bin in ipairs(candidates) do
+        local handle = io.popen(string.format('%s --version 2>&1', bin))
+        if handle then
+            local out = handle:read("*a")
+            handle:close()
+            if out and not out:find("not found") and not out:find("is not recognized") and #out > 0 then
+                return bin
+            end
+        end
+    end
+    return nil
+end
+
+local SQLITE_BIN = find_sqlite_bin()
+
+if not SQLITE_BIN then
+    print("\n==================================================")
+    print("  LuaDB Dark Room: Conformance Test (SKIPPED)")
+    print("==================================================")
+    print("  [SKIP] sqlite3 binary not found on PATH or SQLITE_BIN.")
+    print("  To run this suite, install sqlite3 or set SQLITE_BIN=/path/to/sqlite3")
+    print("==================================================\n")
+    return
+end
+
+local tmp_dir = os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"
+local SQLITE_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_oracle.db"
 local LUADB_DB_LOCAL = "darkroom_subject.db"  -- relative to cwd (luadb root)
 
 local function sqlite_reset()

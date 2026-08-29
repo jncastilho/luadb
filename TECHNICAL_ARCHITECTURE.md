@@ -27,11 +27,11 @@
                          v                               v
 +---------------------------------+             +-------------------------------+
 |  Multi-Region Replication       |             |  Fixed 4KB Slotted Page Engine|
-|  HLC Conflict Resolution        |             |  (NULL/Bool/Int/Float/Text/JSON|
-|  (Hinted Handoff / 24h TTL Log) |             |   Binary Type Tags 0x00-0x05) |
-+---------------------------------+             +-------------------------------+
-                                                         |
-                                                         v
+|  Real HLC State (pt, lc)        |             |  (NULL/Bool/Int/Float/Text/JSON|
+|  State Export/Import            |             |   Binary Type Tags 0x00-0x05) |
+|  (Hinted Handoff / 24h TTL Log) |             +-------------------------------+
++---------------------------------+                              |
+                                                                 v
 +-------------------------------------------------------------------------------+
 |                          Pluggable VFS Storage Layer                          |
 |             +--------------------+-------------------+------------------+     |
@@ -42,7 +42,7 @@
                                                          v
 +-------------------------------------------------------------------------------+
 |                     Dark Room Conformance Oracle (External)                   |
-|                   /usr/bin/sqlite3 — Independent correctness proof            |
+|                   sqlite3 CLI — Independent comparative testing               |
 +-------------------------------------------------------------------------------+
 ```
 
@@ -114,7 +114,7 @@ Recursive-descent parser building AST representations for:
 - **CTEs**: `WITH cte_name AS (...) SELECT ...`.
 
 Key correctness details:
-- `INSERT INTO ... VALUES (...)` uses **direct positional index assignment** (`values[i] = val`) to correctly preserve `NULL` holes in the values array. `table.insert` is avoided because it silently drops `nil` arguments in Lua, causing column value shifts.
+- `INSERT INTO ... VALUES (...)` uses **direct positional index assignment** (`values[i] = val`) with explicit length anchor (`.n`) to preserve `NULL` holes.
 - `OFFSET` is parsed immediately after `LIMIT` and propagated into the AST.
 - `ORDER BY` parses a comma-separated list of `(column, direction)` pairs, enabling multi-column sorting.
 - `GROUP BY` parses a column list and optional `HAVING` clause.
@@ -122,14 +122,15 @@ Key correctness details:
 #### Query Executor (`sql/executor.lua`)
 - **Referential Integrity**: Checks Foreign Key constraints on `INSERT`/`UPDATE` and executes `ON DELETE CASCADE` removals.
 - **Catalog WAL Persistence**: Packs Foreign Key definitions and column metadata into Catalog Page 1 (`TBL:<name>`), persisting constraints across database restarts.
-- **ORDER BY evaluation order**: Sorting is applied to raw indexed rows **before** column projection, so `ORDER BY` columns not present in the `SELECT` list still sort correctly.
-- **GROUP BY**: Groups filtered rows by column value, computes per-group aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), and returns pre-projected records directly. `AVG` / `SUM` skip `NULL` values per SQL standard.
+- **ORDER BY evaluation order**: Sorting is applied to raw indexed rows **before** column projection, so `ORDER BY` columns not present in the `SELECT` list still sort correctly. Unknown `ORDER BY` column names return a SQL execution error.
+- **GROUP BY**: Groups filtered rows using typed group key tags (`N` for NULL, `S:val` for strings, `I:val` for numbers, `B:val` for booleans), preventing `NULL` and empty string `''` collisions. Computes per-group aggregates (`COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`).
+- **Aggregate NULL Semantics**: `COUNT(*)` counts all rows in group; `COUNT(col)`, `AVG(col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` exclude `NULL` values per standard SQL semantics.
 - **LIMIT + OFFSET**: Applied as a slice of the final (sorted, projected) row set: `rows[offset+1 .. offset+limit]`.
 - **LIKE**: Case-insensitive for ASCII characters, matching SQLite's default behaviour.
-- **IS NULL / IS NOT NULL**: Evaluated against the deserialized column value; `NULL` columns deserialize to Lua `nil` (tag `0x00` in the binary page).
+- **IS NULL / IS NOT NULL**: Evaluated against the deserialized column value; `NULL` columns deserialize to Lua `nil` (tag `0x00` in binary pages).
 
 #### SQL Conformance
-The `tests/darkroom_spec.lua` harness provides independent conformance verification by firing 50 SQL statements simultaneously at LuaDB and the system `/usr/bin/sqlite3` binary and comparing results row-by-row. **Current result: 50/50 MATCH**.
+The `tests/darkroom_spec.lua` harness provides independent comparative test coverage by executing 50 SQL statements simultaneously against LuaDB and external `sqlite3` CLI and comparing results row-by-row. **Current result: 50/50 MATCH**.
 
 ---
 
@@ -151,24 +152,24 @@ Implements PostgreSQL v3.0 Server Gateway over non-blocking POSIX sockets (LuaJI
   - Non-blocking socket broadcast to peer nodes.
   - **Hinted Handoff Queue**: Offline peer mutations are buffered in persistent memory queues.
   - **24-Hour TTL Expiration**: Unreachable peers transition to `STALE_EXPIRED` state; expired items move to `pg_failed_replication_log`.
-  - **Snapshot Catch-Up Sync**: Automatically syncs full table data when a stale node recovers.
+  - **Snapshot Catch-Up Sync**: Automatically syncs full table data when a stale node recovers, safely formatting SQL `NULL` values, booleans, and single-quoted text string escapes.
 
 #### 2.6.1. HLC Conflict Resolution (`cluster/conflict.lua`)
 
 In active-active (master-master) topologies, concurrent writes to the same row on different nodes create write conflicts. LuaDB resolves these using **Hybrid Logical Clocks (HLC)**:
 
-- Each write carries a microsecond-precision HLC timestamp: `(physical_time_ms, logical_counter)`.
-- When two nodes disagree on the same primary key, the mutation with the **higher HLC timestamp wins** (Last-Write-Wins).
-- Conflicts are logged to an in-memory conflict history and exposed via the virtual system table `pg_replication_conflicts`:
+- **HLC Clock Maintenance**: Maintains explicit clock state `(last_pt, logical_lc)`:
+  - `pt' = max(last_pt, physical_now, remote_pt)`
+  - If `pt'` equals both local and remote timestamps, `lc'` increments: `max(last_lc, remote_lc) + 1`.
+  - Clock state is updated on **both** local write generation and remote message receipt (`should_apply`), ensuring lagging nodes advance their clocks past received remote timestamps.
+- **Last-Write-Wins (LWW)**: Mutations carry microsecond-precision HLC timestamps `pt * 1000 + lc`. Higher timestamps win; node ID acts as deterministic tie-breaker on collision.
+- **State Export/Import**: Version maps and clock state are exportable (`export_state()`) and importable (`import_state()`) to enable durability across node process restarts.
+- **Conflict Observability**: Conflicts are logged and exposed via the virtual system table `pg_replication_conflicts`:
 
 ```sql
 SELECT * FROM pg_replication_conflicts;
 -- Returns: table_name, pk_val, winner_node, winner_ts, loser_node, loser_ts, reason, resolved_at
 ```
-
-**Architectural considerations** (from `tests/conflict_spec.lua`):
-- Without a strict consensus protocol (Raft/Paxos), split-brain states remain theoretically possible under extreme network partitions.
-- HLC Last-Write-Wins is appropriate for eventually-consistent workloads. Applications requiring strict linearizability should route writes through a single designated master.
 
 ---
 
@@ -189,12 +190,12 @@ luadb/
 │   ├── init.lua               # Main entry point (luadb.open / luadb.pool / db:gc / db:recover)
 │   ├── async/                 # Scheduler & connection pool
 │   ├── cluster/               # Master-master replication, HLC conflict resolution & config
-│   │   ├── conflict.lua       # HLC conflict resolver & pg_replication_conflicts virtual table
+│   │   ├── conflict.lua       # Real HLC state maintenance, LWW resolver & state export/import
 │   │   ├── proto.lua          # Binary replication frame serialization
 │   │   └── replicator.lua     # Broadcast engine, hinted handoff, TTL expiry, snapshot sync
 │   ├── net/                   # PostgreSQL wire protocol socket gateway
 │   ├── sql/                   # Lexer, Parser, Executor, and JSON engine
-│   │   ├── executor.lua       # Query executor (GROUP BY, ORDER BY, OFFSET, NULL, aggregates)
+│   │   ├── executor.lua       # Query executor (COUNT(col), GROUP BY typed keys, ORDER BY validation)
 │   │   ├── lexer.lua          # SQL tokenizer
 │   │   ├── parser.lua         # Recursive-descent AST builder
 │   │   └── json.lua           # JSON/JSONB storage and -> / ->> extraction
@@ -205,9 +206,9 @@ luadb/
 │   │   └── wal.lua            # Write-Ahead Log, BEGIN/COMMIT/ROLLBACK
 │   └── vfs/                   # Local, Memory, and S3 SigV4 VFS drivers
 ├── tests/                     # 16-suite master verification framework
-│   ├── darkroom_spec.lua      # 50-case conformance vs /usr/bin/sqlite3 (50/50 MATCH)
-│   ├── conflict_spec.lua      # HLC conflict resolution correctness
-│   ├── crash_recovery_spec.lua # Deterministic crash recovery fuzzing
+│   ├── darkroom_spec.lua      # 50-case comparative test vs external sqlite3 (50/50 MATCH)
+│   ├── conflict_spec.lua      # HLC clock catch-up, LWW tie-break & state persistence
+│   ├── crash_recovery_spec.lua # Deterministic WAL crash recovery fuzzing
 │   ├── benchmark_spec.lua     # TPS, query latency, and memory footprint metrics
 │   └── run_all.lua            # Master test runner
 ├── README.md                  # Project overview & quickstart
@@ -230,8 +231,9 @@ The following SQL features are verified by `tests/darkroom_spec.lua` against SQL
 | `WHERE ... IS NULL` / `IS NOT NULL` | ✓ |
 | `ORDER BY col ASC/DESC` (single and multi-column) | ✓ |
 | `ORDER BY` on non-projected columns | ✓ |
-| `GROUP BY col` with `COUNT(*)`, `AVG()`, `SUM()` | ✓ |
-| Aggregate NULL exclusion (`AVG` skips NULL rows) | ✓ |
+| `GROUP BY col` with `COUNT(*)`, `COUNT(col)`, `AVG()`, `SUM()` | ✓ |
+| Aggregate NULL exclusion (`COUNT(col)`, `AVG` skip NULL rows) | ✓ |
+| Typed `GROUP BY` separation of `NULL` and empty string `''` | ✓ |
 | `LIMIT n OFFSET m` | ✓ |
 | `UPDATE ... SET ... WHERE` | ✓ |
 | `DELETE FROM ... WHERE` | ✓ |

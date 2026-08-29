@@ -226,15 +226,19 @@ function replicator:trigger_snapshot_sync(target_node, host, port)
                 local pk_val = r["id"] or r[1]
                 for k, v in pairs(r) do
                     table.insert(cols, k)
-                    if type(v) == "string" then
+                    if v == nil then
+                        table.insert(vals, "NULL")
+                    elseif type(v) == "string" then
                         local escaped_v = v:gsub("'", "''")
                         table.insert(vals, string.format("'%s'", escaped_v))
+                    elseif type(v) == "boolean" then
+                        table.insert(vals, v and "TRUE" or "FALSE")
                     else
                         table.insert(vals, tostring(v))
                     end
                 end
                 local sync_sql = string.format("INSERT INTO %s (%s) VALUES (%s);", table_name, table.concat(cols, ", "), table.concat(vals, ", "))
-                local hlc_ts = self.conflict_resolver.now_us()
+                local hlc_ts = self.conflict_resolver:now_us()
                 local sync_payload = proto.serialize_replicate("SYNC_" .. hlc_ts, self.node_id, hlc_ts, sync_sql, table_name, pk_val)
                 self:_send_to_peer(host, port, proto.make_msg("R", sync_payload))
             end

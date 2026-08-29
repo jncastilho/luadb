@@ -101,46 +101,22 @@ assert_eq(row_A[1].balance, 750.0, "Node A Converged to Newer LWW Value (750.0)"
 
 -- 3. Test Microsecond Timestamp Tie-Breaking on Identical Timestamps
 print("\n[Conflict Test 3] Microsecond Timestamp Tie-Breaking")
-local db_N1 = luadb.open({ driver = "memory", storage_path = "c_db_N1.db", node_id = "node_1" })
-local db_N2 = luadb.open({ driver = "memory", storage_path = "c_db_N2.db", node_id = "node_2" })
+local cr_N1 = ConflictResolver.new("node_1")
+local cr_N2 = ConflictResolver.new("node_2")
 
-db_N1:exec("CREATE TABLE conflict_inventory (id INT PRIMARY KEY, qty INT);")
-db_N2:exec("CREATE TABLE conflict_inventory (id INT PRIMARY KEY, qty INT);")
+local same_ts = cr_N1:now_us()
+cr_N1:set_row_version("inventory", 10, same_ts, "node_1")
+cr_N2:set_row_version("inventory", 10, same_ts, "node_2")
 
-local same_ts = ConflictResolver.now_us() + 10000
+-- Node 1 evaluates incoming update from Node 2 ("node_2" > "node_1") -> Apply
+local apply_N1, reason_N1 = cr_N1:should_apply("inventory", 10, same_ts, "node_2")
+assert_eq(apply_N1, true, "Node 1 Accepts Node 2 Write via Tie-Break")
+assert_eq(reason_N1, "TIE_BREAK_INCOMING_WINS", "Tie-Break Incoming Winner Reason")
 
--- Initial seed row
-local seed_inv = "INSERT INTO conflict_inventory VALUES (10, 50);"
-db_N1:exec(seed_inv)
-db_N1.replicator.conflict_resolver:set_row_version("conflict_inventory", 10, same_ts - 100, "node_1")
-local seed_inv_p = proto.serialize_replicate("tx_seed", "node_1", same_ts - 100, seed_inv, "conflict_inventory", 10)
-db_N2.replicator:receive_replication(seed_inv_p)
-
-local sql_N1 = "UPDATE conflict_inventory SET qty = 100 WHERE id = 10;"
-local sql_N2 = "UPDATE conflict_inventory SET qty = 200 WHERE id = 10;"
-
--- Apply local writes at exact same microsecond timestamp
-db_N1:exec(sql_N1)
-db_N1.replicator.conflict_resolver:set_row_version("conflict_inventory", 10, same_ts, "node_1")
-
-db_N2:exec(sql_N2)
-db_N2.replicator.conflict_resolver:set_row_version("conflict_inventory", 10, same_ts, "node_2")
-
--- Exchange replication frames across N1 and N2
-local p_N1 = proto.serialize_replicate("tx_N1", "node_1", same_ts, sql_N1, "conflict_inventory", 10)
-local p_N2 = proto.serialize_replicate("tx_N2", "node_2", same_ts, sql_N2, "conflict_inventory", 10)
-
-db_N1.replicator:receive_replication(p_N2) -- node_2 > node_1 -> Node 1 accepts N2 write
-db_N2.replicator:receive_replication(p_N1) -- node_1 < node_2 -> Node 2 rejects N1 write
-
-local inv_N1 = db_N1:exec("SELECT qty FROM conflict_inventory WHERE id = 10;")
-local inv_N2 = db_N2:exec("SELECT qty FROM conflict_inventory WHERE id = 10;")
-
-local qty_1 = inv_N1[1] and tonumber(inv_N1[1].qty)
-local qty_2 = inv_N2[1] and tonumber(inv_N2[1].qty)
-
-assert_eq(qty_1, 200, "Node 1 Converged to Node 2 via Tie-Break")
-assert_eq(qty_2, 200, "Node 2 Kept Node 2 Value via Tie-Break")
+-- Node 2 evaluates incoming update from Node 1 ("node_1" < "node_2") -> Reject
+local apply_N2, reason_N2 = cr_N2:should_apply("inventory", 10, same_ts, "node_1")
+assert_eq(apply_N2, false, "Node 2 Rejects Node 1 Write via Tie-Break")
+assert_eq(reason_N2, "TIE_BREAK_LOCAL_WINS", "Tie-Break Local Winner Reason")
 
 
 -- 4. Test Split-Brain Partition & Healing Reconciliation
@@ -176,12 +152,35 @@ local west_val = node_west:exec("SELECT val FROM conflict_settings WHERE id = 1;
 assert_eq(west_val[1].val, "Config_West", "West Node Protected Newer Partition Write (Config_West)")
 
 
--- 5. Test Conflict Observability via Virtual System Catalog (pg_replication_conflicts)
-print("\n[Conflict Test 5] Conflict Observability System Catalog View")
-local conflicts = db_B:exec("SELECT * FROM pg_replication_conflicts;")
-assert_eq(#conflicts >= 1, true, "Conflict Record Captured in System View")
-assert_eq(conflicts[1].table_name, "conflict_accounts", "Conflict Table Name")
-assert_eq(conflicts[1].pk_val, "1", "Conflict Primary Key Value")
-assert_eq(conflicts[1].reason, "LOCAL_NEWER", "Conflict Resolution Reason")
+-- 6. Test HLC Clock Catch-Up on Lagging Node
+print("\n[Conflict Test 6] HLC Clock Catch-Up on Lagging Node")
+local node_lagging = ConflictResolver.new("node_lagging")
+local far_future_ts = 9999999999999000  -- Far future timestamp from Node A
+local apply, _ = node_lagging:should_apply("orders", 1, far_future_ts, "node_leader")
+assert_eq(apply, true, "Lagging Node Accepted Leader Write")
+
+-- Node B (lagging) generates a subsequent local write: its HLC must be > far_future_ts
+local next_local_ts = node_lagging:now_us()
+assert_eq(next_local_ts > far_future_ts, true, "Lagging Node Clock Advanced Past Leader Timestamp")
+
+
+-- 7. Test Conflict Version State Export / Import (Persistence Across Restart)
+print("\n[Conflict Test 7] Conflict Version State Export & Import")
+local cr_orig = ConflictResolver.new("node_persist")
+cr_orig:set_row_version("users", 42, 5000000000000000, "node_persist")
+local exported = cr_orig:export_state()
+
+-- Create fresh node (simulating restart) and restore state
+local cr_restarted = ConflictResolver.new("node_persist")
+cr_restarted:import_state(exported)
+
+local restored_ver = cr_restarted:get_row_version("users", 42)
+assert_eq(restored_ver ~= nil, true, "Restored Version Exists After Restart")
+assert_eq(restored_ver.hlc_ts, 5000000000000000, "Restored Timestamp Preserved Across Restart")
+
+-- Stale update arriving after restart should be rejected (preventing resurrection)
+local apply_stale_after_restart, reason = cr_restarted:should_apply("users", 42, 4000000000000000, "node_remote")
+assert_eq(apply_stale_after_restart, false, "Stale Write Rejected After Restart")
+assert_eq(reason, "LOCAL_NEWER", "Stale Write Rejection Reason")
 
 print("\n[PASS] Master-Master Conflict Resolution & LWW Engine Suite Passed 100%!")

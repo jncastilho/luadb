@@ -99,6 +99,30 @@ local res_ts = db:exec("SELECT title, created_at FROM events WHERE id = 1;")
 assert_eq(#res_ts, 1, "Timestamp Query Row Count")
 assert_eq(res_ts[1].created_at, "2026-08-15 00:30:00", "Timestamp Column Value")
 
+-- 11. COUNT(column) vs COUNT(*) NULL SEMANTICS
+print("\n[SQL Test 11] COUNT(col) Excludes NULLs while COUNT(*) Counts All Rows")
+db:exec("CREATE TABLE count_test (id INT PRIMARY KEY, val REAL);")
+db:exec("INSERT INTO count_test VALUES (1, 100.0);")
+db:exec("INSERT INTO count_test VALUES (2, NULL);")
+local res_cstar = db:exec("SELECT COUNT(*) FROM count_test;")
+local res_ccol  = db:exec("SELECT COUNT(val) FROM count_test;")
+assert_eq(res_cstar[1].count_star, 2, "COUNT(*) includes NULL row")
+assert_eq(res_ccol[1].count_val,   1, "COUNT(val) excludes NULL row")
+
+-- 12. GROUP BY NULL vs EMPTY STRING SEPARATION
+print("\n[SQL Test 12] GROUP BY Distinguishes NULL from Empty String ('')")
+db:exec("CREATE TABLE null_str_test (id INT PRIMARY KEY, code TEXT);")
+db:exec("INSERT INTO null_str_test VALUES (1, NULL);")
+db:exec("INSERT INTO null_str_test VALUES (2, '');")
+db:exec("INSERT INTO null_str_test VALUES (3, 'A');")
+local res_gb = db:exec("SELECT code, COUNT(*) FROM null_str_test GROUP BY code ORDER BY code;")
+assert_eq(#res_gb, 3, "GROUP BY produces 3 distinct groups (NULL, '', 'A')")
+
+-- 13. ORDER BY INVALID COLUMN ERROR HANDLING
+print("\n[SQL Test 13] ORDER BY Unknown Column Error")
+local _, err_ord = db:exec("SELECT name FROM sql_employees ORDER BY non_existent_col;")
+assert_eq(err_ord ~= nil, true, "ORDER BY invalid column returns error")
+
 db:close()
 
 print("\n[PASS] SQL Engine & CRUD Suite Completed Successfully!")

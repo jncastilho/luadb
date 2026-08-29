@@ -2,7 +2,7 @@
 
 **LuaDB** is a lightweight, embeddable, zero-dependency Relational Database Management System (RDBMS) written **100% from scratch in pure Lua** (compatible with Lua 5.1+, 5.4, 5.5, and LuaJIT).
 
-It provides full SQL execution, Write-Ahead Logging (WAL) for ACID transactions, a B+Tree indexing engine, a pluggable Virtual File System (VFS) layer (**Local Disk**, **In-Memory RAM**, and **Amazon S3 Object Storage** with AWS SigV4 authentication), a **Native JSON/JSONB Engine**, a **PostgreSQL Wire Protocol Gateway**, **Multi-Region Master-Master Active-Active Cluster Replication** with **Hybrid Logical Clock (HLC) conflict resolution**, **`ALTER TABLE` Schema Migrations**, **Foreign Key `ON DELETE CASCADE` Constraints**, **Common Table Expressions (`WITH` CTEs)**, and a **Dark Room conformance test harness** that validates SQL correctness against SQLite 3 as an independent external oracle.
+It provides full SQL execution, Write-Ahead Logging (WAL) for ACID transactions, a B+Tree indexing engine, a pluggable Virtual File System (VFS) layer (**Local Disk**, **In-Memory RAM**, and **Amazon S3 Object Storage** with AWS SigV4 authentication), a **Native JSON/JSONB Engine**, a **PostgreSQL Wire Protocol Gateway**, **Multi-Region Master-Master Active-Active Cluster Replication** with **Hybrid Logical Clock (HLC) conflict resolution**, **`ALTER TABLE` Schema Migrations**, **Foreign Key `ON DELETE CASCADE` Constraints**, **Common Table Expressions (`WITH` CTEs)**, and an independent **Dark Room conformance test harness** that validates SQL correctness against SQLite 3 as an external oracle.
 
 ---
 
@@ -54,8 +54,8 @@ Run the built-in performance benchmark suite: `lua tests/benchmark_spec.lua`
 - **ACID Transactions & Deterministic Recovery**: Write-Ahead Logging (WAL) with `BEGIN`, `COMMIT`, `ROLLBACK`, and automated crash recovery fuzzing (`tests/crash_recovery_spec.lua`).
 - **SQL Engine — Full Conformance**:
   - `SELECT` with projection, `WHERE`, `AND`/`OR`, `LIKE` (case-insensitive, SQLite-compatible), `IS NULL` / `IS NOT NULL`
-  - `ORDER BY` multi-column (ascending/descending; works on non-projected columns)
-  - `GROUP BY` with aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) — NULLs excluded from aggregates per SQL standard
+  - `ORDER BY` multi-column (ascending/descending; evaluates before projection; validates column names)
+  - `GROUP BY` with aggregate functions (`COUNT(*)`, `COUNT(col)` excluding NULLs, `SUM`, `AVG`, `MIN`, `MAX`) — NULLs and empty strings (`''`) produce distinct groups via typed key tagging
   - `LIMIT` / `OFFSET`
   - `INSERT INTO` with correct NULL column positional storage
   - `UPDATE`, `DELETE` with `WHERE` predicates
@@ -72,9 +72,9 @@ Run the built-in performance benchmark suite: `lua tests/benchmark_spec.lua`
   - Connect standard tools (`psql`, DBeaver, DataGrip, TablePlus) directly via the built-in Postgres v3.0 gateway (`bin/luadb_server.lua`).
 - **Multi-Region Master-Master Cluster**:
   - Active-active node topology, persistent Hinted Handoff queueing for offline nodes, 24-hour TTL expiration logging, and automatic snapshot catch-up sync.
-  - **HLC Conflict Resolution**: Hybrid Logical Clock microsecond timestamps determine write winners in concurrent master-master scenarios. Full conflict history exposed via the `pg_replication_conflicts` virtual system table.
+  - **HLC Conflict Resolution**: Real Hybrid Logical Clock state `(last_pt, logical_lc)` updated on both local and remote events. Determines write winners in concurrent master-master scenarios. Version history is exportable/importable for node restart durability. Full conflict history exposed via `pg_replication_conflicts`.
 - **Dark Room Conformance Test** (`tests/darkroom_spec.lua`):
-  - 50 SQL test cases fired simultaneously at LuaDB and the system `/usr/bin/sqlite3` binary.
+  - Portable conformance test suite executing 50 SQL test cases against SQLite 3 via `SQLITE_BIN` or system PATH.
   - Zero shared code between oracle and subject — LuaDB is treated as a pure black box.
   - Results compared row-by-row, field-by-field. Current result: **50/50 MATCH**.
 
@@ -125,7 +125,7 @@ db:exec("INSERT INTO employees VALUES (102, 'Bob', 1, NULL, NULL);")
 local rows = db:exec("SELECT name, salary FROM employees ORDER BY salary DESC, name ASC;")
 
 -- GROUP BY with aggregates
-local stats = db:exec("SELECT dept_id, COUNT(*), AVG(salary) FROM employees GROUP BY dept_id;")
+local stats = db:exec("SELECT dept_id, COUNT(*), COUNT(salary), AVG(salary) FROM employees GROUP BY dept_id;")
 
 -- LIMIT / OFFSET pagination
 local page = db:exec("SELECT name FROM employees ORDER BY id LIMIT 10 OFFSET 20;")
@@ -230,25 +230,25 @@ luajit tests/run_all.lua
 | `embedding_spec.lua` | Embedded API, pool, and gc integration |
 | `cluster_spec.lua` | Multi-master replication topology and handoff |
 | `live_cluster_spec.lua` | Live active-active cluster simulation |
-| `conflict_spec.lua` | HLC conflict resolution, last-write-wins, merge log |
+| `conflict_spec.lua` | Real HLC conflict resolution, state persistence, and merge log |
 | `json_spec.lua` | JSON/JSONB storage and `->` / `->>` extraction |
 | `foreign_key_spec.lua` | FK constraint enforcement and `ON DELETE CASCADE` |
 | `advanced_features_spec.lua` | CTEs, ALTER TABLE, REINDEX, and edge cases |
 | `bugfixes_spec.lua` | Regression coverage for previously identified bugs |
 | `crash_recovery_spec.lua` | Deterministic WAL crash recovery fuzzing |
-| `darkroom_spec.lua` | **50-case conformance vs SQLite 3 external oracle — 50/50 MATCH** |
+| `darkroom_spec.lua` | **50-case conformance test vs SQLite 3 external oracle — 50/50 MATCH** |
 | `benchmark_spec.lua` | TPS, query latency, and memory footprint metrics |
 | `examples_spec.lua` | End-to-end execution of all example scripts |
 
 ### Dark Room Conformance Test
 
-`tests/darkroom_spec.lua` is the project's independent correctness proof:
+`tests/darkroom_spec.lua` is the project's independent comparative test harness:
 
 ```bash
-lua tests/darkroom_spec.lua
+SQLITE_BIN=sqlite3 lua tests/darkroom_spec.lua
 ```
 
-- **Oracle**: `/usr/bin/sqlite3` (system binary — zero LuaDB code in the oracle path)
+- **Oracle**: SQLite 3 binary (`SQLITE_BIN` env var or PATH — zero LuaDB code in oracle path)
 - **Subject**: LuaDB embedded API (treated as a pure black box)
 - **Method**: Identical SQL fired at both engines; results compared row-by-row, field-by-field
 - **Result**: `50/50 MATCH — LuaDB output is byte-identical to SQLite on all 50 test cases`
