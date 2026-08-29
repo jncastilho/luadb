@@ -143,6 +143,8 @@ function replicator:persist_state()
     if not self.db or self.is_replicating then return end
     self.is_replicating = true
     pcall(function()
+        local in_tx = self.db.wal and self.db.wal.in_tx
+        if not in_tx then self.db:exec("BEGIN TRANSACTION;") end
         self.db:exec("CREATE TABLE IF NOT EXISTS _luadb_conflict_state (k TEXT PRIMARY KEY, v TEXT);")
         local json = require("luadb.sql.json")
         local state = self.conflict_resolver:export_state()
@@ -150,6 +152,7 @@ function replicator:persist_state()
         local escaped = jstr:gsub("'", "''")
         self.db:exec("DELETE FROM _luadb_conflict_state WHERE k = 'state';")
         self.db:exec("INSERT INTO _luadb_conflict_state VALUES ('state', '" .. escaped .. "');")
+        if not in_tx then self.db:exec("COMMIT;") end
     end)
     self.is_replicating = false
 end
@@ -188,7 +191,6 @@ function replicator:broadcast(sql, override_ts)
     local t_name, pk_val = extract_mutation_meta(self.db, sql)
     if t_name and pk_val ~= nil then
         self.conflict_resolver:set_row_version(t_name, pk_val, hlc_ts, self.node_id)
-        self:persist_state()
     end
 
     local payload = proto.serialize_replicate(tx_id, self.node_id, hlc_ts, sql, t_name, pk_val)
@@ -326,6 +328,7 @@ function replicator:receive_replication(payload)
 
     if t_name and pk_val ~= nil then
         self.conflict_resolver:set_row_version(t_name, pk_val, data.timestamp, data.origin_node)
+        self:persist_state()
     end
 
     return true, proto.make_msg("A", data.tx_id)

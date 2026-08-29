@@ -171,12 +171,12 @@ function ConflictResolver:record_conflict(table_name, pk_val, winner_node, winne
         table_name = table_name,
         pk_val = tostring(pk_val or "UNKNOWN"),
         winner_node = winner_node,
-        winner_ts = tonumber(winner_ts) or 0,
+        winner_ts = ConflictResolver.format_hlc(winner_ts),
         loser_node = loser_node,
-        loser_ts = tonumber(loser_ts) or 0,
+        loser_ts = ConflictResolver.format_hlc(loser_ts),
         sql = sql or "",
         reason = reason or "LWW",
-        resolved_at = self:now_us()
+        resolved_at = ConflictResolver.format_hlc(self:now_us())
     })
 end
 

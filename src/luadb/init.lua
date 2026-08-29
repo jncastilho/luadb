@@ -103,6 +103,9 @@ function luadb.open(config)
     end
 
     function db:commit()
+        if self.replicator then
+            self.replicator:persist_state()
+        end
         return self:exec("COMMIT;")
     end
 

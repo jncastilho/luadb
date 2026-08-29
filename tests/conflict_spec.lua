@@ -186,13 +186,13 @@ assert_eq(apply_stale_after_restart, false, "Stale Write Rejected After Restart"
 assert_eq(reason, "LOCAL_NEWER", "Stale Write Rejection Reason")
 
 
--- 8. Test > 1,000 HLC Logical Events Monotonicity (No 1,000 Wrapping)
-print("\n[Conflict Test 8] > 1,000 Logical Events Monotonic Clock Monotonicity")
+-- 8. Test 10,000 HLC Logical Events Monotonicity (No 1,000 Wrapping)
+print("\n[Conflict Test 8] 10,000 Logical Events Monotonic Clock Monotonicity")
 local cr_mono = ConflictResolver.new("node_mono")
 local prev_hlc = cr_mono:now_us()
 local monotonic_ok = true
 
-for i = 1, 1500 do
+for i = 1, 10000 do
     local next_hlc = cr_mono:now_us()
     if ConflictResolver.cmp_hlc(prev_hlc, next_hlc) >= 0 then
         monotonic_ok = false
@@ -200,12 +200,12 @@ for i = 1, 1500 do
     end
     prev_hlc = next_hlc
 end
-assert_eq(monotonic_ok, true, "1,500 Consecutive HLC Timestamps Strictly Monotonic (No 1000 Wrapping)")
-assert_eq(cr_mono.logical_lc >= 1500, true, "Logical Counter Exceeds 1,000 without Truncation")
+assert_eq(monotonic_ok, true, "10,000 Consecutive HLC Timestamps Strictly Monotonic (No 1000 Wrapping)")
+assert_eq(cr_mono.logical_lc >= 10000, true, "Logical Counter Exceeds 10,000 without Truncation")
 
 
 -- 9. Test End-to-End Database Restart Conflict Version Persistence
-print("\n[Conflict Test 9] End-to-End Database Restart Conflict State Recovery")
+print("\n[Conflict Test 9] End-to-End Local Write Restart Conflict State Recovery")
 os.remove("c_restart_test.db")
 local db_p1 = luadb.open({ driver = "local", storage_path = "c_restart_test.db", node_id = "node_p1" })
 db_p1:exec("CREATE TABLE p_orders (id INT PRIMARY KEY, amount REAL);")
@@ -232,5 +232,45 @@ assert_eq(post_restart_val[1].amount, 250.0, "Stale Write Rejected After Restart
 
 db_p2:close()
 os.remove("c_restart_test.db")
+
+
+-- 10. Test Remotely Learned Mutation Version Persistence Across Process Restart
+print("\n[Conflict Test 10] Remotely Received Replication Version Persistence Across Restart")
+os.remove("c_remote_restart.db")
+local db_r1 = luadb.open({ driver = "local", storage_path = "c_remote_restart.db", node_id = "node_local" })
+db_r1:exec("CREATE TABLE r_items (id INT PRIMARY KEY, val TEXT);")
+db_r1:exec("INSERT INTO r_items VALUES (5, 'Initial_Local');")
+
+local r1_hlc = db_r1.replicator.conflict_resolver:get_row_version("r_items", 5).hlc_ts
+
+-- Node B receives remote write from node_remote with higher HLC timestamp (e.g., pt+5000:lc=5)
+local remote_newer_ts = { pt = r1_hlc.pt + 5000, lc = 5 }
+local remote_payload = proto.serialize_replicate("tx_rem_1", "node_remote", remote_newer_ts, "UPDATE r_items SET val = 'Remote_Newer' WHERE id = 5;", "r_items", 5)
+local ok_rem, _ = db_r1.replicator:receive_replication(remote_payload)
+assert_eq(ok_rem, true, "Remote Replication Payload Received and Applied")
+
+local val_applied = db_r1:exec("SELECT val FROM r_items WHERE id = 5;")
+assert_eq(val_applied[1].val, "Remote_Newer", "Remote Write Applied in Memory")
+
+-- Close DB handle without any subsequent local write (simulating node restart right after remote write)
+db_r1:close()
+
+-- Re-open DB handle (process restart)
+local db_r2 = luadb.open({ driver = "local", storage_path = "c_remote_restart.db", node_id = "node_local" })
+local r2_ver = db_r2.replicator.conflict_resolver:get_row_version("r_items", 5)
+assert_eq(r2_ver ~= nil, true, "Remotely Learned Version Map Loaded from Disk Catalog")
+assert_eq(ConflictResolver.cmp_hlc(r2_ver.hlc_ts, remote_newer_ts) == 0, true, "Remotely Learned Version Timestamp Restored")
+
+-- Stale write with older timestamp (remote_newer_ts - 1000) arrives after restart
+local remote_older_ts = { pt = remote_newer_ts.pt - 1000, lc = 0 }
+local older_payload = proto.serialize_replicate("tx_rem_old", "node_remote", remote_older_ts, "UPDATE r_items SET val = 'Stale_Resurrected' WHERE id = 5;", "r_items", 5)
+local ok_old, _ = db_r2.replicator:receive_replication(older_payload)
+assert_eq(ok_old, true, "Older Stale Remote Replication Evaluated Post-Restart")
+
+local val_post_restart = db_r2:exec("SELECT val FROM r_items WHERE id = 5;")
+assert_eq(val_post_restart[1].val, "Remote_Newer", "Stale Remote Update Rejected Post-Restart (Value Remained Remote_Newer)")
+
+db_r2:close()
+os.remove("c_remote_restart.db")
 
 print("\n[PASS] Master-Master Conflict Resolution & LWW Engine Suite Passed 100%!")
