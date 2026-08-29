@@ -273,4 +273,52 @@ assert_eq(val_post_restart[1].val, "Remote_Newer", "Stale Remote Update Rejected
 db_r2:close()
 os.remove("c_remote_restart.db")
 
+
+-- 11. Test ROLLBACK Non-Replication & In-Memory Version Discard
+print("\n[Conflict Test 11] ROLLBACK Non-Replication & Version Reset")
+local db_tx = luadb.open({ driver = "memory", storage_path = "c_tx_test.db", node_id = "node_tx", nodes = "127.0.0.1:9876" })
+db_tx:exec("CREATE TABLE tx_accounts (id INT PRIMARY KEY, balance REAL);")
+db_tx:exec("INSERT INTO tx_accounts VALUES (1, 100.0);")
+
+-- Clear initial seed row version for test isolation
+db_tx.replicator.conflict_resolver.row_versions["tx_accounts"]["1"] = nil
+
+db_tx:begin()
+db_tx:exec("UPDATE tx_accounts SET balance = 0.0 WHERE id = 1;")
+
+-- During transaction, pending queue holds the uncommitted mutation, but in-memory row_versions is NOT updated
+assert_eq(#db_tx.replicator.tx_pending_mutations, 1, "Uncommitted Mutation Queued in Transaction Buffer")
+local ver_during_tx = db_tx.replicator.conflict_resolver:get_row_version("tx_accounts", 1)
+assert_eq(ver_during_tx == nil, true, "In-Memory Row Version Retained Unchanged State During Open Transaction")
+
+db_tx:rollback()
+
+-- After ROLLBACK, pending transaction queue is discarded and row_version remains unpolluted
+assert_eq(#db_tx.replicator.tx_pending_mutations, 0, "Pending Transaction Buffer Discarded on ROLLBACK")
+local ver_post_rollback = db_tx.replicator.conflict_resolver:get_row_version("tx_accounts", 1)
+assert_eq(ver_post_rollback == nil, true, "In-Memory Row Version Unpolluted After ROLLBACK")
+
+
+-- 12. Test Multi-Row & Non-PK Predicate Mutation Version Tracking
+print("\n[Conflict Test 12] Multi-Row & Non-PK Predicate Mutation Version Tracking")
+local db_multi = luadb.open({ driver = "memory", storage_path = "c_multi_test.db", node_id = "node_multi" })
+db_multi:exec("CREATE TABLE multi_users (id INT PRIMARY KEY, tenant_id INT, status TEXT);")
+db_multi:exec("INSERT INTO multi_users VALUES (10, 100, 'active');")
+db_multi:exec("INSERT INTO multi_users VALUES (20, 100, 'active');")
+db_multi:exec("INSERT INTO multi_users VALUES (30, 100, 'active');")
+db_multi:exec("INSERT INTO multi_users VALUES (40, 200, 'active');")
+
+-- Execute multi-row UPDATE with non-PK WHERE predicate (WHERE tenant_id = 100)
+db_multi:exec("UPDATE multi_users SET status = 'disabled' WHERE tenant_id = 100;")
+
+local v10 = db_multi.replicator.conflict_resolver:get_row_version("multi_users", 10)
+local v20 = db_multi.replicator.conflict_resolver:get_row_version("multi_users", 20)
+local v30 = db_multi.replicator.conflict_resolver:get_row_version("multi_users", 30)
+local v40 = db_multi.replicator.conflict_resolver:get_row_version("multi_users", 40)
+
+assert_eq(v10 ~= nil, true, "Multi-Row UPDATE Version Tracked for Row 10")
+assert_eq(v20 ~= nil, true, "Multi-Row UPDATE Version Tracked for Row 20")
+assert_eq(v30 ~= nil, true, "Multi-Row UPDATE Version Tracked for Row 30")
+assert_eq(ConflictResolver.cmp_hlc(v40.hlc_ts, v10.hlc_ts) ~= 0, true, "Non-Matching Row 40 Unaffected by Multi-Row UPDATE")
+
 print("\n[PASS] Master-Master Conflict Resolution & LWW Engine Suite Passed 100%!")

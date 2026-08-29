@@ -147,23 +147,25 @@ Implements PostgreSQL v3.0 Server Gateway over non-blocking POSIX sockets (LuaJI
 ### 2.6. Multi-Region Active-Active Cluster Replication (`cluster/`)
 
 - **Topology Parsing (`cluster/config.lua`)**: Environment topology discovery via `LUADB_NODES`.
-- **Protocol Framing (`cluster/proto.lua`)**: Binary replication packet serialization (`'R'` replication, `'A'` ACK).
+- **Protocol Framing (`cluster/proto.lua`)**: Tuple HLC string representation (`pt:lc`) for network replication framing (`'R'` replication, `'A'` ACK).
 - **Replication Engine (`cluster/replicator.lua`)**:
-  - Non-blocking socket broadcast to peer nodes.
+  - Non-blocking socket broadcast to peer nodes with full `send_all` TCP byte-streaming loops.
+  - **Transaction Isolation**: Mutations inside open transactions (`BEGIN TRANSACTION`) are buffered in memory (`tx_pending_mutations`) and only replicated/persisted upon `COMMIT`. On `ROLLBACK`, uncommitted mutation queues are completely discarded.
+  - **Multi-Row & Non-PK Mutation Tracking**: Query execution directly returns affected primary key lists (`affected_pks`) so multi-row `UPDATE` and `DELETE` queries with arbitrary `WHERE` clauses update HLC row versions for all modified records.
   - **Hinted Handoff Queue**: Offline peer mutations are buffered in persistent memory queues.
   - **24-Hour TTL Expiration**: Unreachable peers transition to `STALE_EXPIRED` state; expired items move to `pg_failed_replication_log`.
-  - **Snapshot Catch-Up Sync**: Automatically syncs full table data when a stale node recovers, safely formatting SQL `NULL` values, booleans, and single-quoted text string escapes.
+  - **Schema-Aware Snapshot Sync**: Uses table catalog metadata to resolve exact primary key column names when generating recovery snapshots for recovering nodes.
 
 #### 2.6.1. HLC Conflict Resolution (`cluster/conflict.lua`)
 
 In active-active (master-master) topologies, concurrent writes to the same row on different nodes create write conflicts. LuaDB resolves these using **Hybrid Logical Clocks (HLC)**:
 
-- **HLC Clock Maintenance**: Maintains explicit clock state `(last_pt, logical_lc)`:
+- **HLC Clock Maintenance**: Maintains explicit clock state `{ pt = physical_us, lc = logical_counter }`:
   - `pt' = max(last_pt, physical_now, remote_pt)`
   - If `pt'` equals both local and remote timestamps, `lc'` increments: `max(last_lc, remote_lc) + 1`.
   - Clock state is updated on **both** local write generation and remote message receipt (`should_apply`), ensuring lagging nodes advance their clocks past received remote timestamps.
-- **Last-Write-Wins (LWW)**: Mutations carry microsecond-precision HLC timestamps `pt * 1000 + lc`. Higher timestamps win; node ID acts as deterministic tie-breaker on collision.
-- **State Export/Import**: Version maps and clock state are exportable (`export_state()`) and importable (`import_state()`) to enable durability across node process restarts.
+- **Canonical 3-Tier Total Ordering**: Deterministic total ordering comparator (`cmp_total`): `HLC physical time (pt)` -> `HLC logical counter (lc)` -> `node ID`.
+- **State Export/Import & Automatic Persistence**: Conflict version maps and clock state are exported/imported and automatically persisted to catalog table `_luadb_conflict_state` on `COMMIT`, `db:close()`, and `receive_replication()`.
 - **Conflict Observability**: Conflicts are logged and exposed via the virtual system table `pg_replication_conflicts`:
 
 ```sql

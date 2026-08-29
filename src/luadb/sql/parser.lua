@@ -330,6 +330,12 @@ function parser._parse_tokens(tokens, sql, params)
         local val_idx = 0
         repeat
             local v = consume()
+            if v and v.type == "SYMBOL" and v.value == "-" then
+                local next_v = consume()
+                if next_v and next_v.type == "NUMBER" then
+                    v = { type = "NUMBER", value = -next_v.value }
+                end
+            end
             if not v or (v.type ~= "STRING" and v.type ~= "NUMBER" and v.type ~= "KEYWORD" and v.type ~= "BOOLEAN") then
                 error("Invalid value in INSERT")
             end

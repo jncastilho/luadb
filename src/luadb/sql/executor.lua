@@ -365,7 +365,7 @@ function executor:execute(ast)
         end
 
         self:_save_catalog()
-        return { message = "Inserted 1 row", row_id = pk_val }
+        return { message = "Inserted 1 row", row_id = pk_val, affected_pks = { pk_val }, table_name = ast.table }
 
     elseif cmd == "SELECT" then
         if not ast.table then
@@ -730,7 +730,7 @@ function executor:execute(ast)
                             local val = nil
                             for _, r in ipairs(g.rows) do
                                 for idx, c in ipairs(meta.columns) do
-                                    if c.name:lower() == col_name:lower() then
+                                    if c.name:lower() == col_name:lower() and r[idx] ~= nil then
                                         if val == nil then val = r[idx]
                                         elseif func == "MIN" and r[idx] ~= nil and r[idx] < val then val = r[idx]
                                         elseif func == "MAX" and r[idx] ~= nil and r[idx] > val then val = r[idx]
@@ -816,7 +816,7 @@ function executor:execute(ast)
                     local val = nil
                     for _, r in ipairs(filtered) do
                         for idx, c in ipairs(meta.columns) do
-                            if c.name:lower() == col_name:lower() then
+                            if c.name:lower() == col_name:lower() and r[idx] ~= nil then
                                 if val == nil then val = r[idx]
                                 elseif func == "MIN" and r[idx] < val then val = r[idx]
                                 elseif func == "MAX" and r[idx] > val then val = r[idx]
@@ -966,11 +966,13 @@ function executor:execute(ast)
         local btree = self:_btree(meta.root_page_id)
         local raw_items = btree:scan_items()
         local count = 0
+        local affected_pks = {}
 
         for _, item in ipairs(raw_items) do
             local key = item.key
             local row = item.row
             if not ast.where or self:_eval_where(ast.where, row, meta.columns) then
+                table.insert(affected_pks, key)
                 for _, assign in ipairs(ast.assignments) do
                     for idx, col in ipairs(meta.columns) do
                         if col.name:lower() == assign.column:lower() then
@@ -997,7 +999,7 @@ function executor:execute(ast)
             end
         end
         self:_save_catalog()
-        return { message = "Updated " .. count .. " rows" }
+        return { message = "Updated " .. count .. " rows", affected_pks = affected_pks, table_name = ast.table }
 
     elseif cmd == "DELETE" then
         local meta = self.catalog[ast.table]
@@ -1043,10 +1045,12 @@ function executor:execute(ast)
         end
 
         local count = 0
+        local affected_pks = {}
         for _, item in ipairs(raw_items) do
             local key = item.key
             local row = item.row
             if not ast.where or self:_eval_where(ast.where, row, meta.columns) then
+                table.insert(affected_pks, key)
                 btree:delete(key)
 
                 -- Remove from secondary indexes
@@ -1066,7 +1070,7 @@ function executor:execute(ast)
             end
         end
         self:_save_catalog()
-        return { message = "Deleted " .. count .. " rows" }
+        return { message = "Deleted " .. count .. " rows", affected_pks = affected_pks, table_name = ast.table }
 
     elseif cmd == "BEGIN" then self.wal:begin() return { message = "Transaction started" }
     elseif cmd == "COMMIT" then self.wal:commit() return { message = "Transaction committed" }

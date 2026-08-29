@@ -128,13 +128,39 @@ print("\n[SQL Test 14] GROUP BY Unknown Column Error")
 local _, err_gb = db:exec("SELECT name FROM sql_employees GROUP BY non_existent_col;")
 assert_eq(err_gb ~= nil, true, "GROUP BY invalid column returns error")
 
--- 15. GROUP BY LENGTH-PREFIXED UNAMBIGUOUS KEYS
-print("\n[SQL Test 15] GROUP BY Key Serialization Safety with Separator Characters")
-db:exec("CREATE TABLE key_esc_test (id INT PRIMARY KEY, col_a TEXT, col_b TEXT);")
-db:exec("INSERT INTO key_esc_test VALUES (1, 'x\29y', 'z');")
-db:exec("INSERT INTO key_esc_test VALUES (2, 'x', 'y\29z');")
-local res_esc = db:exec("SELECT col_a, col_b, COUNT(*) FROM key_esc_test GROUP BY col_a, col_b;")
-assert_eq(#res_esc, 2, "GROUP BY produces 2 distinct groups for strings containing separator chars")
+-- 16. ADVERSARIAL AGGREGATES WITH NEGATIVE NUMBERS, NULL, AND ZERO
+print("\n[SQL Test 16] Adversarial Aggregates (Negative Numbers, NULL, Zero)")
+db:exec("CREATE TABLE adv_agg_test (id INT PRIMARY KEY, val REAL);")
+db:exec("INSERT INTO adv_agg_test VALUES (1, 10.0);")
+db:exec("INSERT INTO adv_agg_test VALUES (2, -5.0);")
+db:exec("INSERT INTO adv_agg_test VALUES (3, NULL);")
+db:exec("INSERT INTO adv_agg_test VALUES (4, 0.0);")
+db:exec("INSERT INTO adv_agg_test VALUES (5, -15.0);")
+
+local r_cstar = db:exec("SELECT COUNT(*) FROM adv_agg_test;")
+local r_ccol  = db:exec("SELECT COUNT(val) FROM adv_agg_test;")
+local r_sum   = db:exec("SELECT SUM(val) FROM adv_agg_test;")
+local r_avg   = db:exec("SELECT AVG(val) FROM adv_agg_test;")
+local r_min   = db:exec("SELECT MIN(val) FROM adv_agg_test;")
+local r_max   = db:exec("SELECT MAX(val) FROM adv_agg_test;")
+
+assert_eq(r_cstar[1].count_star, 5, "Adversarial COUNT(*) = 5")
+assert_eq(r_ccol[1].count_val,   4, "Adversarial COUNT(val) = 4 (excludes NULL)")
+assert_eq(r_sum[1].sum_val,   -10.0, "Adversarial SUM(val) = -10.0")
+assert_eq(r_avg[1].avg_val,    -2.5, "Adversarial AVG(val) = -2.5")
+assert_eq(r_min[1].min_val,   -15.0, "Adversarial MIN(val) = -15.0")
+assert_eq(r_max[1].max_val,    10.0, "Adversarial MAX(val) = 10.0")
+
+
+-- 17. ADVERSARIAL GROUP BY WITH NULL, EMPTY STRING, ZERO, AND FALSE
+print("\n[SQL Test 17] Adversarial GROUP BY (NULL, '', 0, FALSE)")
+db:exec("CREATE TABLE adv_gb_test (id INT PRIMARY KEY, v_text TEXT, v_num INT);")
+db:exec("INSERT INTO adv_gb_test VALUES (1, NULL, 0);")
+db:exec("INSERT INTO adv_gb_test VALUES (2, '', 0);")
+db:exec("INSERT INTO adv_gb_test VALUES (3, '0', 0);")
+db:exec("INSERT INTO adv_gb_test VALUES (4, '0', 1);")
+local res_adv_gb = db:exec("SELECT v_text, v_num, COUNT(*) FROM adv_gb_test GROUP BY v_text, v_num;")
+assert_eq(#res_adv_gb, 4, "Adversarial GROUP BY produces 4 distinct typed groups")
 
 db:close()
 

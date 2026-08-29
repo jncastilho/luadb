@@ -133,32 +133,41 @@ function ConflictResolver:set_row_version(table_name, pk_val, hlc_ts, node_id, p
     }
 end
 
+-- Canonical 3-tier total ordering comparator: HLC physical_us -> HLC logical_counter -> node_id
+-- Returns -1 if a < b, 0 if a == b, 1 if a > b.
+function ConflictResolver.cmp_total(a_hlc, a_node, b_hlc, b_node)
+    local cmp = ConflictResolver.cmp_hlc(a_hlc, b_hlc)
+    if cmp ~= 0 then return cmp end
+    local a_n = tostring(a_node or "")
+    local b_n = tostring(b_node or "")
+    if a_n ~= b_n then
+        return a_n < b_n and -1 or 1
+    end
+    return 0
+end
+
 -- Last-Write-Wins (LWW) with Node-ID Deterministic Tie-Breaking
 -- Updates local HLC clock upon receiving remote timestamp (HLC advance guarantee)
 function ConflictResolver:should_apply(table_name, pk_val, incoming_ts, incoming_node_id)
     incoming_node_id = tostring(incoming_node_id or "")
     local incoming_hlc = ConflictResolver.parse_hlc(incoming_ts)
 
-    -- Advance local HLC state to at least the observed incoming timestamp
-    self:update_hlc(incoming_hlc.pt, incoming_hlc.lc)
-
     local current = self:get_row_version(table_name, pk_val)
     if not current then
-        -- No existing record version: Apply mutation
+        self:update_hlc(incoming_hlc.pt, incoming_hlc.lc)
         return true, "NO_LOCAL_RECORD"
     end
 
-    local cmp = ConflictResolver.cmp_hlc(incoming_hlc, current.hlc_ts)
-    if cmp > 0 then
-        -- Incoming mutation is strictly newer
+    local hlc_cmp = ConflictResolver.cmp_hlc(incoming_hlc, current.hlc_ts)
+    if hlc_cmp > 0 then
+        self:update_hlc(incoming_hlc.pt, incoming_hlc.lc)
         return true, "INCOMING_NEWER"
-    elseif cmp < 0 then
-        -- Local mutation is strictly newer: Reject incoming stale update
+    elseif hlc_cmp < 0 then
         return false, "LOCAL_NEWER"
     else
-        -- Timestamp collision down to microsecond & logical counter: Node ID tie-break
-        local local_node_id = current.node_id or ""
-        if incoming_node_id > local_node_id then
+        local local_node = current.node_id or ""
+        if incoming_node_id > local_node then
+            self:update_hlc(incoming_hlc.pt, incoming_hlc.lc)
             return true, "TIE_BREAK_INCOMING_WINS"
         else
             return false, "TIE_BREAK_LOCAL_WINS"

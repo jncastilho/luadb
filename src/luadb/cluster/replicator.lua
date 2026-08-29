@@ -91,6 +91,7 @@ function replicator.new(db, opts)
     self.node_status = {} -- target_node -> "ONLINE" | "OFFLINE" | "STALE_EXPIRED"
     self.tx_seq = 1
     self.is_replicating = false
+    self.tx_pending_mutations = {}
     self.conflict_resolver = ConflictResolver.new(self.node_id)
 
     -- Initialize peer nodes status
@@ -123,10 +124,24 @@ function replicator:_send_to_peer(host, port, msg_data, timeout_ms)
         ffi.C.usleep(timeout_ms * 1000)
     end
 
-    local sent_bytes = ffi.C.send(sock, msg_data, #msg_data, 0)
-    if sent_bytes > 0 then
+    -- Full send_all buffer flush loop
+    local total_len = #msg_data
+    local offset = 0
+    local attempts = 0
+    while offset < total_len and attempts < 10 do
+        local sub = msg_data:sub(offset + 1)
+        local n = ffi.C.send(sock, sub, #sub, 0)
+        if n > 0 then
+            offset = offset + n
+        else
+            attempts = attempts + 1
+            ffi.C.usleep(10000)
+        end
+    end
+
+    if offset >= total_len then
         local buf = ffi.new("char[1024]")
-        ffi.C.usleep(50000) -- wait ACK window
+        ffi.C.usleep(20000) -- wait ACK window
         local n = ffi.C.recv(sock, buf, 1024, 0)
         ffi.C.close(sock)
         if n > 0 then
@@ -143,7 +158,7 @@ function replicator:persist_state()
     if not self.db or self.is_replicating then return end
     self.is_replicating = true
     pcall(function()
-        local in_tx = self.db.wal and self.db.wal.in_tx
+        local in_tx = self.db.wal and self.db.wal.in_transaction
         if not in_tx then self.db:exec("BEGIN TRANSACTION;") end
         self.db:exec("CREATE TABLE IF NOT EXISTS _luadb_conflict_state (k TEXT PRIMARY KEY, v TEXT);")
         local json = require("luadb.sql.json")
@@ -173,14 +188,7 @@ function replicator:load_persistent_state()
     self.is_replicating = false
 end
 
-function replicator:broadcast(sql, override_ts)
-    if self.is_replicating or not sql or sql == "" then return end
-    if sql:upper():find("_LUADB_") then return end
-    local match_cmd = sql:match("^%s*(%w+)")
-    if not match_cmd then return end
-    local cmd = match_cmd:upper()
-    if cmd == "SELECT" or cmd == "SHOW" then return end
-
+function replicator:_publish_mutation(sql, override_ts, exec_res)
     local hlc_ts = override_ts or self.conflict_resolver:now_us()
     local pt_val = type(hlc_ts) == "table" and hlc_ts.pt or math.floor(tonumber(hlc_ts) or 0)
     local lc_val = type(hlc_ts) == "table" and hlc_ts.lc or 0
@@ -188,12 +196,23 @@ function replicator:broadcast(sql, override_ts)
     self.tx_seq = self.tx_seq + 1
     local tx_id = string.format("%s_%.0f_%.0f_%d", self.node_id, pt_val, lc_val, self.tx_seq)
 
-    local t_name, pk_val = extract_mutation_meta(self.db, sql)
-    if t_name and pk_val ~= nil then
-        self.conflict_resolver:set_row_version(t_name, pk_val, hlc_ts, self.node_id)
+    local affected_pks = exec_res and exec_res.affected_pks
+    local t_name = exec_res and exec_res.table_name
+
+    if not t_name or not affected_pks or #affected_pks == 0 then
+        local ext_t, ext_pk = extract_mutation_meta(self.db, sql)
+        t_name = t_name or ext_t
+        if ext_pk ~= nil then affected_pks = { ext_pk } end
     end
 
-    local payload = proto.serialize_replicate(tx_id, self.node_id, hlc_ts, sql, t_name, pk_val)
+    if t_name and affected_pks and #affected_pks > 0 then
+        for _, pk_val in ipairs(affected_pks) do
+            self.conflict_resolver:set_row_version(t_name, pk_val, hlc_ts, self.node_id)
+        end
+    end
+
+    local primary_pk = (affected_pks and affected_pks[1]) or nil
+    local payload = proto.serialize_replicate(tx_id, self.node_id, hlc_ts, sql, t_name, primary_pk)
     local frame = proto.make_msg("R", payload)
 
     for _, peer in ipairs(self.nodes) do
@@ -219,6 +238,41 @@ function replicator:broadcast(sql, override_ts)
             end
         end
     end
+end
+
+function replicator:broadcast(sql, override_ts, exec_res)
+    if self.is_replicating or not sql or sql == "" then return end
+    if sql:upper():find("_LUADB_") then return end
+    local match_cmd = sql:match("^%s*(%w+)")
+    if not match_cmd then return end
+    local cmd = match_cmd:upper()
+    if cmd == "SELECT" or cmd == "SHOW" or cmd == "BEGIN" or cmd == "COMMIT" or cmd == "ROLLBACK" then return end
+
+    if self.db and self.db.wal and self.db.wal.in_transaction then
+        -- Transaction active: queue mutation until COMMIT
+        table.insert(self.tx_pending_mutations, {
+            sql = sql,
+            override_ts = override_ts,
+            exec_res = exec_res
+        })
+        return
+    end
+
+    self:_publish_mutation(sql, override_ts, exec_res)
+end
+
+function replicator:flush_tx_pending()
+    if #self.tx_pending_mutations == 0 then return end
+    local queue = self.tx_pending_mutations
+    self.tx_pending_mutations = {}
+    for _, item in ipairs(queue) do
+        self:_publish_mutation(item.sql, item.override_ts, item.exec_res)
+    end
+    self:persist_state()
+end
+
+function replicator:discard_tx_pending()
+    self.tx_pending_mutations = {}
 end
 
 function replicator:process_pending_queue()
@@ -256,29 +310,41 @@ end
 
 function replicator:trigger_snapshot_sync(target_node, host, port)
     if not self.db or not self.db.executor or not self.db.executor.catalog then return end
-    for table_name, _ in pairs(self.db.executor.catalog) do
-        local rows = self.db:exec("SELECT * FROM " .. table_name)
-        if rows and #rows > 0 then
-            for _, r in ipairs(rows) do
-                local cols, vals = {}, {}
-                local pk_val = r["id"] or r[1]
-                for k, v in pairs(r) do
-                    table.insert(cols, k)
-                    if v == nil then
-                        table.insert(vals, "NULL")
-                    elseif type(v) == "string" then
-                        local escaped_v = v:gsub("'", "''")
-                        table.insert(vals, string.format("'%s'", escaped_v))
-                    elseif type(v) == "boolean" then
-                        table.insert(vals, v and "TRUE" or "FALSE")
-                    else
-                        table.insert(vals, tostring(v))
+    for table_name, meta in pairs(self.db.executor.catalog) do
+        if not table_name:find("^_") then
+            local rows = self.db:exec("SELECT * FROM " .. table_name)
+            if rows and #rows > 0 then
+                local pk_col_name = "id"
+                if meta and meta.columns then
+                    for _, col in ipairs(meta.columns) do
+                        if col.primary_key then
+                            pk_col_name = col.name
+                            break
+                        end
                     end
                 end
-                local sync_sql = string.format("INSERT INTO %s (%s) VALUES (%s);", table_name, table.concat(cols, ", "), table.concat(vals, ", "))
-                local hlc_ts = self.conflict_resolver:now_us()
-                local sync_payload = proto.serialize_replicate("SYNC_" .. hlc_ts, self.node_id, hlc_ts, sync_sql, table_name, pk_val)
-                self:_send_to_peer(host, port, proto.make_msg("R", sync_payload))
+
+                for _, r in ipairs(rows) do
+                    local cols, vals = {}, {}
+                    local pk_val = r[pk_col_name] or r[pk_col_name:lower()] or r["id"] or r[1]
+                    for k, v in pairs(r) do
+                        table.insert(cols, k)
+                        if v == nil then
+                            table.insert(vals, "NULL")
+                        elseif type(v) == "string" then
+                            local escaped_v = v:gsub("'", "''")
+                            table.insert(vals, string.format("'%s'", escaped_v))
+                        elseif type(v) == "boolean" then
+                            table.insert(vals, v and "TRUE" or "FALSE")
+                        else
+                            table.insert(vals, tostring(v))
+                        end
+                    end
+                    local sync_sql = string.format("INSERT INTO %s (%s) VALUES (%s);", table_name, table.concat(cols, ", "), table.concat(vals, ", "))
+                    local hlc_ts = self.conflict_resolver:now_us()
+                    local sync_payload = proto.serialize_replicate("SYNC_" .. (hlc_ts.pt or 0) .. "_" .. (hlc_ts.lc or 0), self.node_id, hlc_ts, sync_sql, table_name, pk_val)
+                    self:_send_to_peer(host, port, proto.make_msg("R", sync_payload))
+                end
             end
         end
     end

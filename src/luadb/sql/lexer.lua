@@ -89,7 +89,7 @@ function lexer.tokenize(sql)
             table.insert(tokens, { type = "SYMBOL", value = "->" })
             pos = pos + 2
         -- Operators & Punctuation
-        elseif char == "," or char == "(" or char == ")" or char == "*" or char == ";" or char == "." then
+        elseif char == "," or char == "(" or char == ")" or char == "*" or char == ";" or char == "." or char == "+" or char == "-" or char == "/" or char == "%" then
             table.insert(tokens, { type = "SYMBOL", value = char })
             pos = pos + 1
         elseif char == "=" or char == "<" or char == ">" or char == "!" then

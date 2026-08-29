@@ -45,7 +45,7 @@ function luadb.open(config)
         end
         local res, err = self.executor:execute(ast)
         if res and self.replicator and not self.replicator.is_replicating then
-            self.replicator:broadcast(sql)
+            self.replicator:broadcast(sql, nil, res)
         end
         return res, err
     end
@@ -104,12 +104,15 @@ function luadb.open(config)
 
     function db:commit()
         if self.replicator then
-            self.replicator:persist_state()
+            self.replicator:flush_tx_pending()
         end
         return self:exec("COMMIT;")
     end
 
     function db:rollback()
+        if self.replicator then
+            self.replicator:discard_tx_pending()
+        end
         return self:exec("ROLLBACK;")
     end
 
