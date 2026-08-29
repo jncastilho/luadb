@@ -635,12 +635,30 @@ function executor:execute(ast)
 
         -- GROUP BY path
         if ast.group_by and #ast.group_by > 0 then
+            -- Validate all GROUP BY columns exist in catalog schema
+            for _, gb_col in ipairs(ast.group_by) do
+                local found = false
+                for _, col in ipairs(meta.columns) do
+                    if col.name:lower() == gb_col:lower() then
+                        found = true
+                        break
+                    end
+                end
+                if not found then
+                    return nil, "Column not found: " .. gb_col
+                end
+            end
+
             local function make_group_key_part(v)
-                if v == nil then return "N" end
-                local t = type(v)
-                if t == "number" then return "I:" .. tostring(v)
-                elseif t == "boolean" then return "B:" .. (v and "1" or "0")
-                else return "S:" .. tostring(v) end
+                local s = ""
+                if v == nil then s = "N"
+                else
+                    local t = type(v)
+                    if t == "number" then s = "I:" .. tostring(v)
+                    elseif t == "boolean" then s = "B:" .. (v and "1" or "0")
+                    else s = "S:" .. tostring(v) end
+                end
+                return string.format("%d:%s", #s, s)
             end
 
             local groups = {}    -- key -> { rows }
@@ -655,7 +673,7 @@ function executor:execute(ast)
                         end
                     end
                 end
-                local gkey = table.concat(key_parts, "\29") -- ASCII Group Separator \29
+                local gkey = table.concat(key_parts, "")
                 if not groups[gkey] then
                     groups[gkey] = { rows = {}, key_vals = {} }
                     table.insert(group_keys, gkey)

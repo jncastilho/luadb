@@ -33,6 +33,42 @@ function ConflictResolver.new(node_id)
     return self
 end
 
+-- Lexicographical HLC comparator: compares physical micros first, then logical counter.
+-- Returns -1 if a < b, 0 if a == b, 1 if a > b.
+function ConflictResolver.cmp_hlc(a, b)
+    local a_pt = (type(a) == "table" and a.pt) or tonumber(a) or 0
+    local a_lc = (type(a) == "table" and a.lc) or 0
+    local b_pt = (type(b) == "table" and b.pt) or tonumber(b) or 0
+    local b_lc = (type(b) == "table" and b.lc) or 0
+
+    if a_pt ~= b_pt then
+        return a_pt < b_pt and -1 or 1
+    end
+    if a_lc ~= b_lc then
+        return a_lc < b_lc and -1 or 1
+    end
+    return 0
+end
+
+function ConflictResolver.format_hlc(hlc)
+    if type(hlc) == "table" then
+        return string.format("%.0f:%.0f", tonumber(hlc.pt) or 0, tonumber(hlc.lc) or 0)
+    end
+    return string.format("%.0f:0", tonumber(hlc) or 0)
+end
+
+function ConflictResolver.parse_hlc(str)
+    if type(str) == "table" then return str end
+    if type(str) == "number" then return { pt = str, lc = 0 } end
+    if not str then return { pt = 0, lc = 0 } end
+    local pt_s, lc_s = tostring(str):match("^([%d%.]+):([%d%.]+)$")
+    if pt_s then
+        return { pt = tonumber(pt_s) or 0, lc = tonumber(lc_s) or 0 }
+    end
+    local num = tonumber(str) or 0
+    return { pt = num, lc = 0 }
+end
+
 -- Update HLC state on event (local write or received remote timestamp)
 -- HLC Algorithm:
 --   pt' = max(last_pt, physical_now, remote_pt)
@@ -42,6 +78,10 @@ end
 --   else:                           lc' = 0
 function ConflictResolver:update_hlc(remote_pt, remote_lc)
     local phys = get_physical_micros()
+    if type(remote_pt) == "table" then
+        remote_lc = remote_pt.lc
+        remote_pt = remote_pt.pt
+    end
     remote_pt = tonumber(remote_pt) or 0
     remote_lc = tonumber(remote_lc) or 0
 
@@ -58,15 +98,12 @@ function ConflictResolver:update_hlc(remote_pt, remote_lc)
     end
 
     self.last_pt = max_pt
-    -- Encoded HLC timestamp: microsecond physical time + 3-digit logical counter
-    local composite_ts = self.last_pt * 1000 + (self.logical_lc % 1000)
-    return composite_ts, self.last_pt, self.logical_lc
+    return { pt = self.last_pt, lc = self.logical_lc }
 end
 
 function ConflictResolver.now_us(self_or_nil)
     local target = (type(self_or_nil) == "table" and self_or_nil.update_hlc) and self_or_nil or ConflictResolver.new("static")
-    local composite_ts, _, _ = target:update_hlc(0, 0)
-    return composite_ts
+    return target:update_hlc(0, 0)
 end
 
 function ConflictResolver:get_row_version(table_name, pk_val)
@@ -83,31 +120,27 @@ function ConflictResolver:set_row_version(table_name, pk_val, hlc_ts, node_id, p
         self.row_versions[t_name] = {}
     end
 
-    local ts_num = tonumber(hlc_ts)
-    if not ts_num then
-        ts_num, pt, lc = self:update_hlc(pt, lc)
+    local hlc_obj = ConflictResolver.parse_hlc(hlc_ts)
+    if not hlc_ts then
+        hlc_obj = self:update_hlc(pt, lc)
     end
 
     self.row_versions[t_name][tostring(pk_val)] = {
-        hlc_ts = ts_num,
+        hlc_ts = hlc_obj,
         node_id = node_id or self.node_id,
-        pt = pt or math.floor(ts_num / 1000),
-        lc = lc or (ts_num % 1000)
+        pt = hlc_obj.pt,
+        lc = hlc_obj.lc
     }
 end
 
 -- Last-Write-Wins (LWW) with Node-ID Deterministic Tie-Breaking
 -- Updates local HLC clock upon receiving remote timestamp (HLC advance guarantee)
-function ConflictResolver:should_apply(table_name, pk_val, incoming_ts, incoming_node_id, incoming_pt, incoming_lc)
-    incoming_ts = tonumber(incoming_ts) or 0
+function ConflictResolver:should_apply(table_name, pk_val, incoming_ts, incoming_node_id)
     incoming_node_id = tostring(incoming_node_id or "")
-
-    -- Extract pt and lc if passed or compute from composite incoming_ts
-    if not incoming_pt then incoming_pt = math.floor(incoming_ts / 1000) end
-    if not incoming_lc then incoming_lc = incoming_ts % 1000 end
+    local incoming_hlc = ConflictResolver.parse_hlc(incoming_ts)
 
     -- Advance local HLC state to at least the observed incoming timestamp
-    self:update_hlc(incoming_pt, incoming_lc)
+    self:update_hlc(incoming_hlc.pt, incoming_hlc.lc)
 
     local current = self:get_row_version(table_name, pk_val)
     if not current then
@@ -115,17 +148,16 @@ function ConflictResolver:should_apply(table_name, pk_val, incoming_ts, incoming
         return true, "NO_LOCAL_RECORD"
     end
 
-    local local_ts = current.hlc_ts
-    local local_node_id = current.node_id
-
-    if incoming_ts > local_ts then
+    local cmp = ConflictResolver.cmp_hlc(incoming_hlc, current.hlc_ts)
+    if cmp > 0 then
         -- Incoming mutation is strictly newer
         return true, "INCOMING_NEWER"
-    elseif incoming_ts < local_ts then
+    elseif cmp < 0 then
         -- Local mutation is strictly newer: Reject incoming stale update
         return false, "LOCAL_NEWER"
     else
-        -- Timestamp collision down to microsecond: Deterministic Node ID tie-breaking
+        -- Timestamp collision down to microsecond & logical counter: Node ID tie-break
+        local local_node_id = current.node_id or ""
         if incoming_node_id > local_node_id then
             return true, "TIE_BREAK_INCOMING_WINS"
         else

@@ -123,6 +123,19 @@ print("\n[SQL Test 13] ORDER BY Unknown Column Error")
 local _, err_ord = db:exec("SELECT name FROM sql_employees ORDER BY non_existent_col;")
 assert_eq(err_ord ~= nil, true, "ORDER BY invalid column returns error")
 
+-- 14. GROUP BY INVALID COLUMN ERROR HANDLING
+print("\n[SQL Test 14] GROUP BY Unknown Column Error")
+local _, err_gb = db:exec("SELECT name FROM sql_employees GROUP BY non_existent_col;")
+assert_eq(err_gb ~= nil, true, "GROUP BY invalid column returns error")
+
+-- 15. GROUP BY LENGTH-PREFIXED UNAMBIGUOUS KEYS
+print("\n[SQL Test 15] GROUP BY Key Serialization Safety with Separator Characters")
+db:exec("CREATE TABLE key_esc_test (id INT PRIMARY KEY, col_a TEXT, col_b TEXT);")
+db:exec("INSERT INTO key_esc_test VALUES (1, 'x\29y', 'z');")
+db:exec("INSERT INTO key_esc_test VALUES (2, 'x', 'y\29z');")
+local res_esc = db:exec("SELECT col_a, col_b, COUNT(*) FROM key_esc_test GROUP BY col_a, col_b;")
+assert_eq(#res_esc, 2, "GROUP BY produces 2 distinct groups for strings containing separator chars")
+
 db:close()
 
 print("\n[PASS] SQL Engine & CRUD Suite Completed Successfully!")

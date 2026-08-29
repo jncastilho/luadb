@@ -28,7 +28,7 @@ local cr = ConflictResolver.new("node_us_east")
 
 cr:set_row_version("conflict_orders", 101, 1000200, "node_us_east")
 local v1 = cr:get_row_version("conflict_orders", 101)
-assert_eq(v1.hlc_ts, 1000200, "Recorded Row Version Microsecond Timestamp")
+assert_eq(v1.hlc_ts.pt, 1000200, "Recorded Row Version Microsecond Timestamp")
 assert_eq(v1.node_id, "node_us_east", "Recorded Row Version Node ID")
 
 -- Newer incoming timestamp (1000500 > 1000200) -> Should Apply
@@ -62,8 +62,8 @@ db_B:exec("CREATE TABLE conflict_accounts (id INT PRIMARY KEY, holder TEXT, bala
 
 local base_ts = ConflictResolver.now_us()
 local t0 = base_ts
-local t1 = base_ts + 1000
-local t2 = base_ts + 5000
+local t1 = { pt = base_ts.pt + 1000, lc = 0 }
+local t2 = { pt = base_ts.pt + 5000, lc = 0 }
 
 -- Initial seed row
 db_A:exec("INSERT INTO conflict_accounts VALUES (1, 'Alice', 500.0);")
@@ -127,9 +127,9 @@ local node_west = luadb.open({ driver = "memory", storage_path = "c_node_west.db
 node_east:exec("CREATE TABLE conflict_settings (id INT PRIMARY KEY, val TEXT);")
 node_west:exec("CREATE TABLE conflict_settings (id INT PRIMARY KEY, val TEXT);")
 
-local sb_ts = ConflictResolver.now_us() + 20000
-local ts_east = sb_ts + 1000
-local ts_west = sb_ts + 5000 -- West node is newer
+local sb_base = ConflictResolver.now_us()
+local ts_east = { pt = sb_base.pt + 1000, lc = 0 }
+local ts_west = { pt = sb_base.pt + 5000, lc = 0 } -- West node is newer
 
 -- Partition state: node_west offline
 -- node_east performs update at ts_east
@@ -155,19 +155,20 @@ assert_eq(west_val[1].val, "Config_West", "West Node Protected Newer Partition W
 -- 6. Test HLC Clock Catch-Up on Lagging Node
 print("\n[Conflict Test 6] HLC Clock Catch-Up on Lagging Node")
 local node_lagging = ConflictResolver.new("node_lagging")
-local far_future_ts = 9999999999999000  -- Far future timestamp from Node A
+local far_future_ts = { pt = 9999999999999000, lc = 0 }  -- Far future timestamp from Node A
 local apply, _ = node_lagging:should_apply("orders", 1, far_future_ts, "node_leader")
 assert_eq(apply, true, "Lagging Node Accepted Leader Write")
 
 -- Node B (lagging) generates a subsequent local write: its HLC must be > far_future_ts
 local next_local_ts = node_lagging:now_us()
-assert_eq(next_local_ts > far_future_ts, true, "Lagging Node Clock Advanced Past Leader Timestamp")
+assert_eq(ConflictResolver.cmp_hlc(next_local_ts, far_future_ts) > 0, true, "Lagging Node Clock Advanced Past Leader Timestamp")
 
 
 -- 7. Test Conflict Version State Export / Import (Persistence Across Restart)
 print("\n[Conflict Test 7] Conflict Version State Export & Import")
 local cr_orig = ConflictResolver.new("node_persist")
-cr_orig:set_row_version("users", 42, 5000000000000000, "node_persist")
+local test_hlc = { pt = 5000000000000000, lc = 5 }
+cr_orig:set_row_version("users", 42, test_hlc, "node_persist")
 local exported = cr_orig:export_state()
 
 -- Create fresh node (simulating restart) and restore state
@@ -176,11 +177,60 @@ cr_restarted:import_state(exported)
 
 local restored_ver = cr_restarted:get_row_version("users", 42)
 assert_eq(restored_ver ~= nil, true, "Restored Version Exists After Restart")
-assert_eq(restored_ver.hlc_ts, 5000000000000000, "Restored Timestamp Preserved Across Restart")
+assert_eq(ConflictResolver.cmp_hlc(restored_ver.hlc_ts, test_hlc) == 0, true, "Restored Timestamp Preserved Across Restart")
 
 -- Stale update arriving after restart should be rejected (preventing resurrection)
-local apply_stale_after_restart, reason = cr_restarted:should_apply("users", 42, 4000000000000000, "node_remote")
+local stale_ts = { pt = test_hlc.pt - 10000, lc = 0 }
+local apply_stale_after_restart, reason = cr_restarted:should_apply("users", 42, stale_ts, "node_remote")
 assert_eq(apply_stale_after_restart, false, "Stale Write Rejected After Restart")
 assert_eq(reason, "LOCAL_NEWER", "Stale Write Rejection Reason")
+
+
+-- 8. Test > 1,000 HLC Logical Events Monotonicity (No 1,000 Wrapping)
+print("\n[Conflict Test 8] > 1,000 Logical Events Monotonic Clock Monotonicity")
+local cr_mono = ConflictResolver.new("node_mono")
+local prev_hlc = cr_mono:now_us()
+local monotonic_ok = true
+
+for i = 1, 1500 do
+    local next_hlc = cr_mono:now_us()
+    if ConflictResolver.cmp_hlc(prev_hlc, next_hlc) >= 0 then
+        monotonic_ok = false
+        error(string.format("Monotonicity violation at event %d: prev=%s >= next=%s", i, ConflictResolver.format_hlc(prev_hlc), ConflictResolver.format_hlc(next_hlc)))
+    end
+    prev_hlc = next_hlc
+end
+assert_eq(monotonic_ok, true, "1,500 Consecutive HLC Timestamps Strictly Monotonic (No 1000 Wrapping)")
+assert_eq(cr_mono.logical_lc >= 1500, true, "Logical Counter Exceeds 1,000 without Truncation")
+
+
+-- 9. Test End-to-End Database Restart Conflict Version Persistence
+print("\n[Conflict Test 9] End-to-End Database Restart Conflict State Recovery")
+os.remove("c_restart_test.db")
+local db_p1 = luadb.open({ driver = "local", storage_path = "c_restart_test.db", node_id = "node_p1" })
+db_p1:exec("CREATE TABLE p_orders (id INT PRIMARY KEY, amount REAL);")
+db_p1:exec("INSERT INTO p_orders VALUES (100, 250.0);")
+
+local hlc_before_close = db_p1.replicator.conflict_resolver:get_row_version("p_orders", 100).hlc_ts
+db_p1:close()
+
+-- Re-open database handle (simulating process restart)
+local db_p2 = luadb.open({ driver = "local", storage_path = "c_restart_test.db", node_id = "node_p1" })
+local ver_obj = db_p2.replicator.conflict_resolver:get_row_version("p_orders", 100)
+local hlc_after_open = ver_obj and ver_obj.hlc_ts
+
+assert_eq(hlc_after_open ~= nil, true, "Conflict Version Map Recovered Automatically on Open")
+assert_eq(ConflictResolver.cmp_hlc(hlc_after_open, hlc_before_close) == 0, true, "Recovered Row HLC Timestamp Matches Pre-Restart State")
+
+-- Verify a stale replication payload (older HLC) is rejected after restart
+local stale_payload = proto.serialize_replicate("tx_stale", "node_remote", { pt = hlc_after_open.pt - 10000, lc = 0 }, "UPDATE p_orders SET amount = 10.0 WHERE id = 100;", "p_orders", 100)
+local ok_stale, _ = db_p2.replicator:receive_replication(stale_payload)
+assert_eq(ok_stale, true, "Replication Handler Executed Stale Check")
+
+local post_restart_val = db_p2:exec("SELECT amount FROM p_orders WHERE id = 100;")
+assert_eq(post_restart_val[1].amount, 250.0, "Stale Write Rejected After Restart (Amount Remained 250.0)")
+
+db_p2:close()
+os.remove("c_restart_test.db")
 
 print("\n[PASS] Master-Master Conflict Resolution & LWW Engine Suite Passed 100%!")

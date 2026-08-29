@@ -139,20 +139,56 @@ function replicator:_send_to_peer(host, port, msg_data, timeout_ms)
     return false, "Connection failed or peer offline"
 end
 
+function replicator:persist_state()
+    if not self.db or self.is_replicating then return end
+    self.is_replicating = true
+    pcall(function()
+        self.db:exec("CREATE TABLE IF NOT EXISTS _luadb_conflict_state (k TEXT PRIMARY KEY, v TEXT);")
+        local json = require("luadb.sql.json")
+        local state = self.conflict_resolver:export_state()
+        local jstr = json.stringify(state)
+        local escaped = jstr:gsub("'", "''")
+        self.db:exec("DELETE FROM _luadb_conflict_state WHERE k = 'state';")
+        self.db:exec("INSERT INTO _luadb_conflict_state VALUES ('state', '" .. escaped .. "');")
+    end)
+    self.is_replicating = false
+end
+
+function replicator:load_persistent_state()
+    if not self.db then return end
+    self.is_replicating = true
+    pcall(function()
+        local rows = self.db:exec("SELECT v FROM _luadb_conflict_state WHERE k = 'state';")
+        if rows and rows[1] and rows[1].v then
+            local json = require("luadb.sql.json")
+            local state = json.parse(rows[1].v)
+            if state then
+                self.conflict_resolver:import_state(state)
+            end
+        end
+    end)
+    self.is_replicating = false
+end
+
 function replicator:broadcast(sql, override_ts)
     if self.is_replicating or not sql or sql == "" then return end
+    if sql:upper():find("_LUADB_") then return end
     local match_cmd = sql:match("^%s*(%w+)")
     if not match_cmd then return end
     local cmd = match_cmd:upper()
     if cmd == "SELECT" or cmd == "SHOW" then return end
 
-    local hlc_ts = tonumber(override_ts) or self.conflict_resolver.now_us()
+    local hlc_ts = override_ts or self.conflict_resolver:now_us()
+    local pt_val = type(hlc_ts) == "table" and hlc_ts.pt or math.floor(tonumber(hlc_ts) or 0)
+    local lc_val = type(hlc_ts) == "table" and hlc_ts.lc or 0
+
     self.tx_seq = self.tx_seq + 1
-    local tx_id = string.format("%s_%d_%d", self.node_id, hlc_ts, self.tx_seq)
+    local tx_id = string.format("%s_%.0f_%.0f_%d", self.node_id, pt_val, lc_val, self.tx_seq)
 
     local t_name, pk_val = extract_mutation_meta(self.db, sql)
     if t_name and pk_val ~= nil then
         self.conflict_resolver:set_row_version(t_name, pk_val, hlc_ts, self.node_id)
+        self:persist_state()
     end
 
     local payload = proto.serialize_replicate(tx_id, self.node_id, hlc_ts, sql, t_name, pk_val)
@@ -173,7 +209,7 @@ function replicator:broadcast(sql, override_ts)
                     port = peer.port,
                     payload = payload,
                     frame = frame,
-                    created_at = math.floor(hlc_ts / 1000000),
+                    created_at = math.floor(pt_val / 1000000),
                     hlc_ts = hlc_ts,
                     status = "PENDING",
                     attempts = 1
