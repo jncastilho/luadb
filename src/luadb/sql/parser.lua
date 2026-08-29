@@ -327,18 +327,22 @@ function parser._parse_tokens(tokens, sql, params)
         if not match_symbol("(") then error("Expected '(' before values") end
 
         local values = {}
+        local val_idx = 0
         repeat
             local v = consume()
             if not v or (v.type ~= "STRING" and v.type ~= "NUMBER" and v.type ~= "KEYWORD" and v.type ~= "BOOLEAN") then
                 error("Invalid value in INSERT")
             end
+            val_idx = val_idx + 1
             local val_to_store = v.value
             local str_val = tostring(v.value):upper()
             if str_val == "TRUE" then val_to_store = true
-            elseif str_val == "FALSE" then val_to_store = false end
-            table.insert(values, val_to_store)
+            elseif str_val == "FALSE" then val_to_store = false
+            elseif str_val == "NULL" then val_to_store = nil end
+            values[val_idx] = val_to_store  -- Direct index preserves nil holes
             if not match_symbol(",") then break end
         until false
+        values.n = val_idx  -- Anchor length so code can determine count including nils
 
         if not match_symbol(")") then error("Expected ')' after values") end
         match_symbol(";")
@@ -452,23 +456,52 @@ function parser._parse_tokens(tokens, sql, params)
             if ok then where_clause = res end
         end
 
-        local order_by = nil
-        if match_keyword("ORDER") then
+        local group_by = nil
+        if match_keyword("GROUP") then
             if match_keyword("BY") then
-                local tok = consume()
-                if tok then
-                    local col = tok.value
-                    local dir = "ASC"
-                    if match_keyword("DESC") then dir = "DESC" else match_keyword("ASC") end
-                    order_by = { column = col, direction = dir }
+                local cols = {}
+                repeat
+                    local tok = consume()
+                    if tok then table.insert(cols, tostring(tok.value)) end
+                    if not match_symbol(",") then break end
+                until false
+                group_by = cols
+                match_keyword("HAVING") -- optional HAVING clause: consume keyword then expression
+                if peek() and peek().value ~= ";" and peek().value:upper() ~= "ORDER" and peek().value:upper() ~= "LIMIT" then
+                    pcall(parse_expression)
                 end
             end
         end
 
+        local order_by = nil
+        if match_keyword("ORDER") then
+            if match_keyword("BY") then
+                local sort_cols = {}
+                repeat
+                    local tok = consume()
+                    if tok then
+                        local col = tok.value
+                        local dir = "ASC"
+                        if match_keyword("DESC") then dir = "DESC" else match_keyword("ASC") end
+                        table.insert(sort_cols, { column = col, direction = dir })
+                        if not match_symbol(",") then break end
+                    else
+                        break
+                    end
+                until false
+                order_by = sort_cols
+            end
+        end
+
         local limit = nil
+        local offset = nil
         if match_keyword("LIMIT") then
             local lim_tok = consume()
             if lim_tok and lim_tok.type == "NUMBER" then limit = lim_tok.value end
+            if match_keyword("OFFSET") then
+                local off_tok = consume()
+                if off_tok and off_tok.type == "NUMBER" then offset = off_tok.value end
+            end
         end
 
         -- Consume any remaining tokens up to semicolon
@@ -483,8 +516,10 @@ function parser._parse_tokens(tokens, sql, params)
             table = table_name,
             join = join_clause,
             where = where_clause,
+            group_by = group_by,
             order_by = order_by,
-            limit = limit
+            limit = limit,
+            offset = offset
         }
     end
 

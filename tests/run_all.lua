@@ -2,7 +2,7 @@ print("==================================================")
 print("  LuaDB Complete RDBMS Verification Suite (Verbose)  ")
 print("==================================================")
 -- Clean up any leftover temporary database files from previous runs
-for _, db_file in ipairs({ "temp_test.db", "employees.db", "json_test.db", "bugfix.db", "fk_test.db", "adv_test.db", "example_local.db", "reindex_test.db", "standalone_node.db", "cloud_database.db", "kamailio_cdr.db", "test_crud.db" }) do
+for _, db_file in ipairs({ "temp_test.db", "employees.db", "json_test.db", "bugfix.db", "fk_test.db", "adv_test.db", "example_local.db", "reindex_test.db", "standalone_node.db", "cloud_database.db", "kamailio_cdr.db", "test_crud.db", "app.db", "test.db", "bugfix_test.db", "mydata.db", "luadb.db", "sql_spec_clean.db", "c_db_A.db", "c_db_B.db", "c_db_N1.db", "c_db_N2.db", "c_node_east.db", "c_node_west.db" }) do
     os.remove(db_file)
 end
 dofile("tests/vfs_spec.lua")
@@ -12,14 +12,16 @@ dofile("tests/coroutine_spec.lua")
 dofile("tests/embedding_spec.lua")
 dofile("tests/cluster_spec.lua")
 dofile("tests/live_cluster_spec.lua")
+dofile("tests/conflict_spec.lua")
 dofile("tests/json_spec.lua")
 dofile("tests/foreign_key_spec.lua")
 dofile("tests/advanced_features_spec.lua")
 dofile("tests/bugfixes_spec.lua")
 dofile("tests/crash_recovery_spec.lua")
+dofile("tests/darkroom_spec.lua")
 dofile("tests/benchmark_spec.lua")
 dofile("tests/examples_spec.lua")
 
 print("\n==================================================")
-print("   🎉 ALL VERIFICATION TESTS PASSED 100%!        ")
+print("   [OK] Master Verification Suite Completed (100% Pass)")
 print("==================================================\n")

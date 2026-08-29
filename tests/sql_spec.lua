@@ -14,23 +14,24 @@ print("\n--------------------------------------------------")
 print("[TEST SUITE] SQL Parser, Query Executor & CRUD")
 print("--------------------------------------------------")
 
-local db = luadb.open({ driver = "memory", storage_path = "test_crud.db" })
+os.remove("sql_spec_clean.db")
+local db = luadb.open({ driver = "memory", storage_path = "sql_spec_clean.db" })
 
 -- 1. CREATE TABLE
 print("\n[SQL Test 1] CREATE TABLE Statement")
-print("  > SQL: CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
-local res1 = db:exec("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
-assert_eq(res1.message, "Table created: employees", "Catalog Table Creation")
+print("  > SQL: CREATE TABLE sql_employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
+local res1 = db:exec("CREATE TABLE sql_employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, role TEXT);")
+assert_eq(res1.message, "Table created: sql_employees", "Catalog Table Creation")
 
 -- 2. CREATE INDEX
 print("\n[SQL Test 2] CREATE INDEX Statement")
-print("  > SQL: CREATE INDEX idx_emp_salary ON employees (salary);")
-local res_idx = db:exec("CREATE INDEX idx_emp_salary ON employees (salary);")
+print("  > SQL: CREATE INDEX idx_emp_salary ON sql_employees (salary);")
+local res_idx = db:exec("CREATE INDEX idx_emp_salary ON sql_employees (salary);")
 assert_eq(res_idx.message, "Index created: idx_emp_salary", "Secondary B+Tree Index Creation")
 
 -- 3. INSERT INTO with Prepared Statements
 print("\n[SQL Test 3] INSERT INTO Statements & Prepared Statements")
-local stmt = db:prepare("INSERT INTO employees VALUES (?, ?, ?, ?);")
+local stmt = db:prepare("INSERT INTO sql_employees VALUES (?, ?, ?, ?);")
 stmt:exec(1, "Alice", 90000, "Engineering")
 stmt:exec(2, "Bob", 75000, "Design")
 stmt:exec(3, "Charlie", 110000, "Engineering")
@@ -38,8 +39,8 @@ print("  ✓ [OK] Prepared Statement Execution with Parameter Binding")
 
 -- 4. SELECT with WHERE & ORDER BY & LIMIT
 print("\n[SQL Test 4] SELECT Query Execution")
-print("  > SQL: SELECT name, salary FROM employees WHERE role = 'Engineering' ORDER BY salary DESC;")
-local res_select = db:exec("SELECT name, salary FROM employees WHERE role = 'Engineering' ORDER BY salary DESC;")
+print("  > SQL: SELECT name, salary FROM sql_employees WHERE role = 'Engineering' ORDER BY salary DESC;")
+local res_select = db:exec("SELECT name, salary FROM sql_employees WHERE role = 'Engineering' ORDER BY salary DESC;")
 print(string.format("  > Returned %d records", #res_select))
 for idx, row in ipairs(res_select) do
     print(string.format("    Row %d: name='%s', salary=%.2f", idx, row.name, row.salary))
@@ -50,44 +51,44 @@ assert_eq(res_select[2].name, "Alice", "Second Row Name")
 
 -- 5. SQL Aggregate Functions
 print("\n[SQL Test 5] SQL Aggregate Functions (COUNT, SUM, AVG, MAX)")
-local res_cnt = db:exec("SELECT COUNT(*) FROM employees;")
+local res_cnt = db:exec("SELECT COUNT(*) FROM sql_employees;")
 assert_eq(res_cnt[1].count_star, 3, "Aggregate COUNT(*)")
 
-local res_sum = db:exec("SELECT SUM(salary) FROM employees;")
+local res_sum = db:exec("SELECT SUM(salary) FROM sql_employees;")
 assert_eq(res_sum[1].sum_salary, 275000, "Aggregate SUM(salary)")
 
-local res_max = db:exec("SELECT MAX(salary) FROM employees;")
+local res_max = db:exec("SELECT MAX(salary) FROM sql_employees;")
 assert_eq(res_max[1].max_salary, 110000, "Aggregate MAX(salary)")
 
 -- 6. LIKE Operator Matching
 print("\n[SQL Test 6] LIKE Wildcard Pattern Matching")
-local res_like = db:exec("SELECT name FROM employees WHERE name LIKE 'A%';")
+local res_like = db:exec("SELECT name FROM sql_employees WHERE name LIKE 'A%';")
 assert_eq(#res_like, 1, "LIKE 'A%' matching count")
 assert_eq(res_like[1].name, "Alice", "LIKE matching name")
 
 -- 7. UPDATE
 print("\n[SQL Test 7] UPDATE Statement")
-print("  > SQL: UPDATE employees SET salary = 95000 WHERE name = 'Alice';")
-db:exec("UPDATE employees SET salary = 95000 WHERE name = 'Alice';")
-local res_up = db:exec("SELECT salary FROM employees WHERE name = 'Alice';")
+print("  > SQL: UPDATE sql_employees SET salary = 95000 WHERE name = 'Alice';")
+db:exec("UPDATE sql_employees SET salary = 95000 WHERE name = 'Alice';")
+local res_up = db:exec("SELECT salary FROM sql_employees WHERE name = 'Alice';")
 assert_eq(res_up[1].salary, 95000, "Updated Salary Verification")
 
 -- 8. DELETE
 print("\n[SQL Test 8] DELETE Statement")
-print("  > SQL: DELETE FROM employees WHERE name = 'Bob';")
-db:exec("DELETE FROM employees WHERE name = 'Bob';")
-local res_del = db:exec("SELECT * FROM employees;")
+print("  > SQL: DELETE FROM sql_employees WHERE name = 'Bob';")
+db:exec("DELETE FROM sql_employees WHERE name = 'Bob';")
+local res_del = db:exec("SELECT * FROM sql_employees;")
 assert_eq(#res_del, 2, "Remaining Record Count after Delete")
 
 -- 9. TRANSACTIONS & ROLLBACK
 print("\n[SQL Test 9] Write-Ahead Logging Transactions & ROLLBACK")
 print("  > SQL: BEGIN TRANSACTION;")
 db:begin()
-print("  > SQL: INSERT INTO employees VALUES (4, 'Dave', 60000, 'Marketing');")
-db:exec("INSERT INTO employees VALUES (4, 'Dave', 60000, 'Marketing');")
+print("  > SQL: INSERT INTO sql_employees VALUES (4, 'Dave', 60000, 'Marketing');")
+db:exec("INSERT INTO sql_employees VALUES (4, 'Dave', 60000, 'Marketing');")
 print("  > SQL: ROLLBACK;")
 db:rollback()
-local res_trans = db:exec("SELECT * FROM employees WHERE name = 'Dave';")
+local res_trans = db:exec("SELECT * FROM sql_employees WHERE name = 'Dave';")
 assert_eq(#res_trans, 0, "Uncommitted Record Absence Verification")
 
 -- 10. TIMESTAMP & TEMPORAL DATA TYPES

@@ -39,7 +39,7 @@ local function on_sip_call_end(call_id, caller, callee, duration)
         print(string.format("  -> Published CDR %s to Kafka topic 'sip-cdrs'", call_id))
         is_published = true
     else
-        print(string.format("  ⚠️ Kafka unavailable! Buffering CDR %s locally to LuaDB (published = false)", call_id))
+        print(string.format("  [WARN] Kafka unavailable! Buffering CDR %s locally to LuaDB (published = false)", call_id))
     end
 
     local sql = string.format("INSERT INTO kamailio_cdrs VALUES ('%s', '%s', '%s', %d, '%s', '2026-08-15 01:28:00');",
@@ -62,7 +62,7 @@ local function drain_pending_cdrs()
     local pending = db:exec("SELECT * FROM kamailio_cdrs WHERE published = 'false';")
     local count = 0
     for _, cdr in ipairs(pending) do
-        print(string.format("  🚀 Draining CDR %s (Caller: %s, Duration: %ds) -> Published to Kafka!", cdr.call_id, cdr.caller, cdr.duration))
+        print(string.format("  [DRAIN] Draining CDR %s (Caller: %s, Duration: %ds) -> Published to Kafka!", cdr.call_id, cdr.caller, cdr.duration))
         db:exec(string.format("UPDATE kamailio_cdrs SET published = 'true' WHERE call_id = '%s';", cdr.call_id))
         count = count + 1
     end

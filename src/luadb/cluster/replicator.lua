@@ -2,6 +2,7 @@ local ffi_ok, ffi = pcall(require, "ffi")
 local bit = ffi_ok and require("bit")
 local config = require("luadb.cluster.config")
 local proto = require("luadb.cluster.proto")
+local ConflictResolver = require("luadb.cluster.conflict")
 
 local replicator = {}
 replicator.__index = replicator
@@ -34,6 +35,45 @@ local F_GETFL = 3
 local F_SETFL = 4
 local O_NONBLOCK = 2048
 
+local function extract_mutation_meta(db, sql)
+    if not sql or not db or not db.executor then return nil, nil end
+    local ok, parser = pcall(require, "luadb.sql.parser")
+    if not ok or not parser then return nil, nil end
+
+    local ok_p, ast = pcall(parser.parse, sql)
+    if not ok_p or not ast or not ast.table then return nil, nil end
+
+    local table_name = ast.table
+    local meta = db.executor.catalog and db.executor.catalog[table_name:lower()]
+    if not meta then return table_name, nil end
+
+    local pk_col_name, pk_col_idx = nil, nil
+    for idx, col in ipairs(meta.columns) do
+        if col.is_pk then
+            pk_col_name = col.name
+            pk_col_idx = idx
+            break
+        end
+    end
+    if not pk_col_name then
+        pk_col_name = meta.columns[1] and meta.columns[1].name
+        pk_col_idx = 1
+    end
+    if not pk_col_name then return table_name, nil end
+
+    local pk_val = nil
+    local cmd = ast.command and ast.command:upper()
+    if cmd == "INSERT" and ast.values then
+        pk_val = ast.values[pk_col_idx]
+    elseif (cmd == "UPDATE" or cmd == "DELETE") and ast.where then
+        if ast.where.left and ast.where.left:lower() == pk_col_name:lower() and ast.where.op == "=" then
+            pk_val = ast.where.right
+        end
+    end
+
+    return table_name, pk_val
+end
+
 function replicator.new(db, opts)
     opts = opts or {}
     local self = setmetatable({}, replicator)
@@ -51,6 +91,7 @@ function replicator.new(db, opts)
     self.node_status = {} -- target_node -> "ONLINE" | "OFFLINE" | "STALE_EXPIRED"
     self.tx_seq = 1
     self.is_replicating = false
+    self.conflict_resolver = ConflictResolver.new(self.node_id)
 
     -- Initialize peer nodes status
     for _, peer in ipairs(self.nodes) do
@@ -79,7 +120,6 @@ function replicator:_send_to_peer(host, port, msg_data, timeout_ms)
 
     local ret = ffi.C.connect(sock, addr, ffi.sizeof(addr))
     if ret < 0 then
-        -- Wait brief non-blocking connection window
         ffi.C.usleep(timeout_ms * 1000)
     end
 
@@ -99,29 +139,32 @@ function replicator:_send_to_peer(host, port, msg_data, timeout_ms)
     return false, "Connection failed or peer offline"
 end
 
-function replicator:broadcast(sql)
+function replicator:broadcast(sql, override_ts)
     if self.is_replicating or not sql or sql == "" then return end
-    -- Filter read-only queries
     local match_cmd = sql:match("^%s*(%w+)")
     if not match_cmd then return end
     local cmd = match_cmd:upper()
     if cmd == "SELECT" or cmd == "SHOW" then return end
 
-    local now = os.time()
+    local hlc_ts = tonumber(override_ts) or self.conflict_resolver.now_us()
     self.tx_seq = self.tx_seq + 1
-    local tx_id = string.format("%s_%d_%d", self.node_id, now, self.tx_seq)
-    local payload = proto.serialize_replicate(tx_id, self.node_id, now, sql)
+    local tx_id = string.format("%s_%d_%d", self.node_id, hlc_ts, self.tx_seq)
+
+    local t_name, pk_val = extract_mutation_meta(self.db, sql)
+    if t_name and pk_val ~= nil then
+        self.conflict_resolver:set_row_version(t_name, pk_val, hlc_ts, self.node_id)
+    end
+
+    local payload = proto.serialize_replicate(tx_id, self.node_id, hlc_ts, sql, t_name, pk_val)
     local frame = proto.make_msg("R", payload)
 
     for _, peer in ipairs(self.nodes) do
-        -- Skip self node match
         local is_self = (peer.port == self.self_port) and (peer.host == "127.0.0.1" or peer.host == "localhost" or peer.raw == self.node_id)
         if not is_self then
-            local ok, resp = self:_send_to_peer(peer.host, peer.port, frame)
+            local ok, _ = self:_send_to_peer(peer.host, peer.port, frame)
             if ok then
                 self.node_status[peer.raw] = "ONLINE"
             else
-                -- Peer is offline/unreachable: Store in persistent Hinted Handoff Queue
                 self.node_status[peer.raw] = "OFFLINE"
                 table.insert(self.pending_queue, {
                     tx_id = tx_id,
@@ -130,7 +173,8 @@ function replicator:broadcast(sql)
                     port = peer.port,
                     payload = payload,
                     frame = frame,
-                    created_at = now,
+                    created_at = math.floor(hlc_ts / 1000000),
+                    hlc_ts = hlc_ts,
                     status = "PENDING",
                     attempts = 1
                 })
@@ -140,25 +184,22 @@ function replicator:broadcast(sql)
 end
 
 function replicator:process_pending_queue()
-    local now = os.time()
+    local now_sec = os.time()
     local active_queue = {}
 
     for _, item in ipairs(self.pending_queue) do
-        local age = now - item.created_at
+        local age = now_sec - item.created_at
         if age > self.ttl_seconds then
-            -- 24h TTL Expired: Keep track in persistent table of failures
             if item.status ~= "UNDELIVERED_EXPIRED" then
                 item.status = "UNDELIVERED_EXPIRED"
-                item.expired_at = now
+                item.expired_at = now_sec
                 table.insert(self.failed_log, item)
             end
             self.node_status[item.target_node] = "STALE_EXPIRED"
-            -- Expired items are NOT kept in active_queue (moved to failed_log only)
         elseif item.status == "PENDING" then
             local ok, _ = self:_send_to_peer(item.host, item.port, item.frame)
             if ok then
                 item.status = "DELIVERED"
-                -- Check if node was previously STALE_EXPIRED; trigger full catch-up snapshot sync if needed
                 if self.node_status[item.target_node] == "STALE_EXPIRED" then
                     self:trigger_snapshot_sync(item.target_node, item.host, item.port)
                 end
@@ -176,13 +217,13 @@ function replicator:process_pending_queue()
 end
 
 function replicator:trigger_snapshot_sync(target_node, host, port)
-    -- Perform full table data snapshot sync for nodes recovering after 24h+ TTL offline window
     if not self.db or not self.db.executor or not self.db.executor.catalog then return end
     for table_name, _ in pairs(self.db.executor.catalog) do
         local rows = self.db:exec("SELECT * FROM " .. table_name)
         if rows and #rows > 0 then
             for _, r in ipairs(rows) do
                 local cols, vals = {}, {}
+                local pk_val = r["id"] or r[1]
                 for k, v in pairs(r) do
                     table.insert(cols, k)
                     if type(v) == "string" then
@@ -193,7 +234,8 @@ function replicator:trigger_snapshot_sync(target_node, host, port)
                     end
                 end
                 local sync_sql = string.format("INSERT INTO %s (%s) VALUES (%s);", table_name, table.concat(cols, ", "), table.concat(vals, ", "))
-                local sync_payload = proto.serialize_replicate("SYNC_" .. os.time(), self.node_id, os.time(), sync_sql)
+                local hlc_ts = self.conflict_resolver.now_us()
+                local sync_payload = proto.serialize_replicate("SYNC_" .. hlc_ts, self.node_id, hlc_ts, sync_sql, table_name, pk_val)
                 self:_send_to_peer(host, port, proto.make_msg("R", sync_payload))
             end
         end
@@ -204,6 +246,35 @@ function replicator:receive_replication(payload)
     local data = proto.deserialize_replicate(payload)
     if not data or not data.sql then return false, "Invalid replication payload" end
 
+    local t_name = data.table_name
+    local pk_val = data.pk_val
+
+    if not t_name or pk_val == nil then
+        local extracted_t, extracted_pk = extract_mutation_meta(self.db, data.sql)
+        t_name = t_name or extracted_t
+        pk_val = pk_val or extracted_pk
+    end
+
+    -- Last-Write-Wins (LWW) Conflict Evaluation
+    if t_name and pk_val ~= nil then
+        local should_apply, reason = self.conflict_resolver:should_apply(t_name, pk_val, data.timestamp, data.origin_node)
+        if not should_apply then
+            local current = self.conflict_resolver:get_row_version(t_name, pk_val)
+            self.conflict_resolver:record_conflict(
+                t_name,
+                pk_val,
+                current and current.node_id or self.node_id,
+                current and current.hlc_ts or 0,
+                data.origin_node,
+                data.timestamp,
+                data.sql,
+                reason
+            )
+            -- Acknowledge without applying stale write
+            return true, proto.make_msg("A", data.tx_id)
+        end
+    end
+
     -- Suppress recursive propagation loop
     self.is_replicating = true
     local ok, res, err = pcall(function() return self.db:exec(data.sql) end)
@@ -213,7 +284,15 @@ function replicator:receive_replication(payload)
         return false, tostring(err or res)
     end
 
+    if t_name and pk_val ~= nil then
+        self.conflict_resolver:set_row_version(t_name, pk_val, data.timestamp, data.origin_node)
+    end
+
     return true, proto.make_msg("A", data.tx_id)
+end
+
+function replicator:get_conflict_log()
+    return self.conflict_resolver.conflict_log
 end
 
 return replicator

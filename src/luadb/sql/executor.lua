@@ -303,15 +303,17 @@ function executor:execute(ast)
                     if c_name:lower() == col.name:lower() then val = ast.values[i] break end
                 end
                 if col.primary_key and val then pk_val = val end
-                table.insert(row, val)
+                row[col_idx] = val   -- Direct assignment preserves nil holes
             end
         else
             for col_idx, col in ipairs(meta.columns) do
                 local val = ast.values[col_idx]
                 if col.primary_key and val then pk_val = val end
-                table.insert(row, val)
+                row[col_idx] = val   -- Direct assignment preserves nil holes
             end
         end
+        -- Anchor the row length so pack_row serializes nil slots (NULL columns)
+        row.n = #meta.columns
 
         -- Foreign Key Insert Validation
         if meta.foreign_keys then
@@ -487,6 +489,23 @@ function executor:execute(ast)
                         })
                     end
                 end
+            elseif tbl_lower:find("pg_replication_conflicts") then
+                raw_catalog_rows = {}
+                if self.replicator and self.replicator.conflict_resolver then
+                    for _, item in ipairs(self.replicator.conflict_resolver.conflict_log or {}) do
+                        table.insert(raw_catalog_rows, {
+                            table_name = item.table_name,
+                            pk_val = item.pk_val,
+                            winner_node = item.winner_node,
+                            winner_ts = item.winner_ts,
+                            loser_node = item.loser_node,
+                            loser_ts = item.loser_ts,
+                            sql = item.sql,
+                            reason = item.reason,
+                            resolved_at = item.resolved_at
+                        })
+                    end
+                end
             else
                 raw_catalog_rows = { { oid = 1, name = "public" } }
             end
@@ -610,9 +629,117 @@ function executor:execute(ast)
             if match then table.insert(filtered, row) end
         end
 
-        -- Check Aggregates
+        -- Check Aggregates (non-GROUP BY path: single aggregate row)
         local first_proj = ast.projections and ast.projections[1]
-        if first_proj and first_proj.type == "AGGREGATE" then
+        local has_aggregate = first_proj and first_proj.type == "AGGREGATE"
+
+        -- GROUP BY path
+        if ast.group_by and #ast.group_by > 0 then
+            local groups = {}    -- key -> { rows }
+            local group_keys = {} -- ordered list of group key strings
+            for _, row in ipairs(filtered) do
+                local key_parts = {}
+                for _, gb_col in ipairs(ast.group_by) do
+                    for idx, col in ipairs(meta.columns) do
+                        if col.name:lower() == gb_col:lower() then
+                            table.insert(key_parts, tostring(row[idx] or ""))
+                            break
+                        end
+                    end
+                end
+                local gkey = table.concat(key_parts, "|")
+                if not groups[gkey] then
+                    groups[gkey] = { rows = {}, key_vals = {} }
+                    table.insert(group_keys, gkey)
+                    for _, gb_col in ipairs(ast.group_by) do
+                        for idx, col in ipairs(meta.columns) do
+                            if col.name:lower() == gb_col:lower() then
+                                groups[gkey].key_vals[col.name] = row[idx]
+                                break
+                            end
+                        end
+                    end
+                end
+                table.insert(groups[gkey].rows, row)
+            end
+
+            local agg_rows = {}
+            for _, gkey in ipairs(group_keys) do
+                local g = groups[gkey]
+                local rec = {}
+                -- Add group-by columns to record
+                for k, v in pairs(g.key_vals) do rec[k] = v end
+                -- Compute aggregates
+                for _, proj in ipairs(ast.projections) do
+                    if proj.type == "AGGREGATE" then
+                        local func = proj.func
+                        local col_name = proj.column
+                        local res_val = 0
+                        if func == "COUNT" then
+                            res_val = #g.rows
+                        elseif func == "SUM" or func == "AVG" then
+                            local sum, count = 0, 0
+                            for _, r in ipairs(g.rows) do
+                                for idx, c in ipairs(meta.columns) do
+                                    if c.name:lower() == col_name:lower() and type(r[idx]) == "number" then
+                                        sum = sum + r[idx]; count = count + 1
+                                    end
+                                end
+                            end
+                            res_val = (func == "AVG" and count > 0) and (sum / count) or sum
+                        elseif func == "MIN" or func == "MAX" then
+                            local val = nil
+                            for _, r in ipairs(g.rows) do
+                                for idx, c in ipairs(meta.columns) do
+                                    if c.name:lower() == col_name:lower() then
+                                        if val == nil then val = r[idx]
+                                        elseif func == "MIN" and r[idx] ~= nil and r[idx] < val then val = r[idx]
+                                        elseif func == "MAX" and r[idx] ~= nil and r[idx] > val then val = r[idx]
+                                        end
+                                    end
+                                end
+                            end
+                            res_val = val or 0
+                        end
+                        local key_name = proj.alias or (func:lower() .. "_" .. (col_name == "*" and "star" or col_name))
+                        rec[key_name] = res_val
+                    end
+                end
+                table.insert(agg_rows, rec)
+            end
+            filtered = agg_rows
+            -- agg_rows are already key-value records (fully projected).
+            -- Apply ORDER BY directly on them, then LIMIT/OFFSET, then return.
+            if ast.order_by then
+                local sort_cols = ast.order_by
+                table.sort(filtered, function(a, b)
+                    for _, ob in ipairs(sort_cols) do
+                        local col_name = ob.column:lower()
+                        local desc     = (ob.direction == "DESC")
+                        local a_val, b_val
+                        for k, v in pairs(a) do if k:lower() == col_name then a_val = v break end end
+                        for k, v in pairs(b) do if k:lower() == col_name then b_val = v break end end
+                        if a_val ~= b_val then
+                            if a_val == nil then return desc end
+                            if b_val == nil then return not desc end
+                            if type(a_val) ~= type(b_val) then a_val = tostring(a_val); b_val = tostring(b_val) end
+                            if desc then return a_val > b_val else return a_val < b_val end
+                        end
+                    end
+                    return false
+                end)
+            end
+            local start_g = ast.offset and (ast.offset + 1) or 1
+            if ast.limit or ast.offset then
+                local limited = {}
+                local end_g = ast.limit and (start_g + ast.limit - 1) or #filtered
+                for i = start_g, math.min(end_g, #filtered) do table.insert(limited, filtered[i]) end
+                filtered = limited
+            end
+            return filtered
+        end
+
+        if has_aggregate then
             local agg_record = {}
             for _, proj in ipairs(ast.projections) do
                 local func = proj.func
@@ -654,6 +781,37 @@ function executor:execute(ast)
             return { agg_record }
         end
 
+        -- ORDER BY (multi-column) -- must run BEFORE projection so non-selected
+        -- columns (e.g. ORDER BY id when SELECT name) are still accessible.
+        if ast.order_by and not (ast.group_by and #ast.group_by > 0) then
+            local sort_cols = ast.order_by
+            -- Build a helper: column name -> schema index for O(1) lookup
+            local col_idx_map = {}
+            for idx, col in ipairs(meta.columns) do
+                col_idx_map[col.name:lower()] = idx
+            end
+            table.sort(filtered, function(ra, rb)
+                for _, ob in ipairs(sort_cols) do
+                    local col_name = ob.column:lower()
+                    local desc     = (ob.direction == "DESC")
+                    local cidx     = col_idx_map[col_name]
+                    local a_val = cidx and ra[cidx] or nil
+                    local b_val = cidx and rb[cidx] or nil
+                    if a_val ~= b_val then
+                        if a_val == nil then return desc end
+                        if b_val == nil then return not desc end
+                        if type(a_val) ~= type(b_val) then
+                            a_val = tostring(a_val)
+                            b_val = tostring(b_val)
+                        end
+                        if desc then return a_val > b_val
+                        else return a_val < b_val end
+                    end
+                end
+                return false
+            end)
+        end
+
         -- Map projection columns
         local final_rows = {}
         for _, row in ipairs(filtered) do
@@ -686,43 +844,44 @@ function executor:execute(ast)
             table.insert(final_rows, record)
         end
 
-        -- ORDER BY
-        if ast.order_by then
-            local col_name = ast.order_by.column
-            local col_num = tonumber(col_name)
-            local desc = (ast.order_by.direction == "DESC")
+        -- ORDER BY for GROUP BY results (already projected, sort on result fields)
+        if ast.order_by and ast.group_by and #ast.group_by > 0 then
+            local sort_cols = ast.order_by
             table.sort(final_rows, function(a, b)
-                local a_val, b_val
-                if col_num then
-                    local keys = {}
-                    for k, _ in pairs(a) do table.insert(keys, k) end
-                    table.sort(keys)
-                    a_val = a[keys[col_num] or keys[1]]
-                    b_val = b[keys[col_num] or keys[1]]
-                else
+                for _, ob in ipairs(sort_cols) do
+                    local col_name = ob.column:lower()
+                    local desc     = (ob.direction == "DESC")
+                    local a_val, b_val
                     for k, v in pairs(a) do
-                        if k:lower() == col_name:lower() then a_val = v break end
+                        if k:lower() == col_name then a_val = v break end
                     end
                     for k, v in pairs(b) do
-                        if k:lower() == col_name:lower() then b_val = v break end
+                        if k:lower() == col_name then b_val = v break end
+                    end
+                    if a_val ~= b_val then
+                        if a_val == nil then return desc end
+                        if b_val == nil then return not desc end
+                        if type(a_val) ~= type(b_val) then
+                            a_val = tostring(a_val)
+                            b_val = tostring(b_val)
+                        end
+                        if desc then return a_val > b_val
+                        else return a_val < b_val end
                     end
                 end
-                if a_val == nil and b_val == nil then return false end
-                if a_val == nil then return false end
-                if b_val == nil then return true end
-                if type(a_val) ~= type(b_val) then
-                    a_val = tostring(a_val)
-                    b_val = tostring(b_val)
-                end
-                if desc then return a_val > b_val
-                else return a_val < b_val end
+                return false
             end)
         end
 
-        -- LIMIT
-        if ast.limit and #final_rows > ast.limit then
+        -- LIMIT + OFFSET
+        local start_idx = 1
+        if ast.offset then start_idx = ast.offset + 1 end
+        if ast.limit or ast.offset then
             local lim_rows = {}
-            for i = 1, ast.limit do table.insert(lim_rows, final_rows[i]) end
+            local end_idx = ast.limit and (start_idx + ast.limit - 1) or #final_rows
+            for i = start_idx, math.min(end_idx, #final_rows) do
+                table.insert(lim_rows, final_rows[i])
+            end
             final_rows = lim_rows
         end
 
@@ -953,8 +1112,11 @@ function executor:_eval_where(where, row, columns)
             return false
         elseif op == "LIKE" then
             if not val or not target then return false end
-            local pattern = "^" .. target:gsub("%%", ".*"):gsub("_", ".") .. "$"
-            return string.match(tostring(val), pattern) ~= nil
+            -- SQLite LIKE is case-insensitive for ASCII (the default)
+            local lval    = tostring(val):lower()
+            local ltarget = tostring(target):lower()
+            local pattern = "^" .. ltarget:gsub("%%", ".*"):gsub("_", ".") .. "$"
+            return string.match(lval, pattern) ~= nil
         elseif op == "IS NULL" then
             return val == nil
         elseif op == "IS NOT NULL" then
