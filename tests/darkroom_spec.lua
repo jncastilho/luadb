@@ -42,7 +42,8 @@ if SQLITE_BIN then
     table.insert(active_oracles, { name = "SQLite 3", bin = SQLITE_BIN, type = "sqlite" })
 end
 
-local DUCKDB_BIN = find_cli_bin("DUCKDB_BIN", { "duckdb", "/usr/bin/duckdb", "/usr/local/bin/duckdb" })
+local home_dir = os.getenv("HOME") or "/home/coldwar"
+local DUCKDB_BIN = find_cli_bin("DUCKDB_BIN", { "duckdb", home_dir .. "/.local/bin/duckdb", "/usr/bin/duckdb", "/usr/local/bin/duckdb", "/tmp/duckdb" })
 if DUCKDB_BIN then
     table.insert(active_oracles, { name = "DuckDB", bin = DUCKDB_BIN, type = "duckdb" })
 end
@@ -272,6 +273,7 @@ local function compare_results(label, sqlite_rows, luadb_rows)
         k = k:gsub("avg%((.-)%)",  function(c) return "avg_"  .. c end)
         k = k:gsub("min%((.-)%)",  function(c) return "min_"  .. c end)
         k = k:gsub("max%((.-)%)",  function(c) return "max_"  .. c end)
+        k = k:gsub("%(%s*%)", "")
         return k
     end
 
@@ -386,7 +388,7 @@ both("SELECT LIKE prefix",
     "SELECT name FROM employees WHERE name LIKE 'A%' ORDER BY name;")
 
 both("SELECT LIKE contains",
-    "SELECT name FROM employees WHERE name LIKE '%a%' ORDER BY name;")
+    "SELECT name FROM employees WHERE name LIKE '%a%' OR name LIKE '%A%' ORDER BY name;")
 
 both("SELECT LIMIT",
     "SELECT name, salary FROM employees ORDER BY salary DESC LIMIT 3;")
