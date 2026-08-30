@@ -48,12 +48,17 @@ if DUCKDB_BIN then
     table.insert(active_oracles, { name = "DuckDB", bin = DUCKDB_BIN, type = "duckdb" })
 end
 
+local CLICKHOUSE_BIN = find_cli_bin("CLICKHOUSE_BIN", { "clickhouse", home_dir .. "/.local/bin/clickhouse", "/usr/bin/clickhouse", "/usr/local/bin/clickhouse" })
+if CLICKHOUSE_BIN and os.getenv("CLICKHOUSE_TEST") == "1" then
+    table.insert(active_oracles, { name = "ClickHouse Local", bin = CLICKHOUSE_BIN, type = "clickhouse" })
+end
+
 if #active_oracles == 0 then
     print("\n==================================================")
     print("  LuaDB Dark Room: Conformance Test (SKIPPED)")
     print("==================================================")
-    print("  [SKIP] No external database CLI oracle (sqlite3, duckdb) found.")
-    print("  To run this suite, install sqlite3 or duckdb.")
+    print("  [SKIP] No external database CLI oracle (sqlite3, duckdb, clickhouse) found.")
+    print("  To run this suite, install sqlite3, duckdb, or clickhouse.")
     print("==================================================\n")
     return
 end
@@ -178,6 +183,42 @@ local function duckdb_exec(sql)
     return parse_csv_output(output)
 end
 
+local CLICKHOUSE_DIR = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_ch_dir"
+
+local function clickhouse_reset()
+    os.execute("rm -rf " .. CLICKHOUSE_DIR)
+    os.execute("mkdir -p " .. CLICKHOUSE_DIR)
+end
+
+local function clickhouse_exec(sql)
+    local ch_sql = sql
+    if ch_sql:upper():find("^CREATE TABLE ") and not ch_sql:upper():find("ENGINE%s*=") then
+        ch_sql = ch_sql:gsub("PRIMARY KEY", "")
+        ch_sql = ch_sql:gsub(";%s*$", "") .. " ENGINE = StripeLog;"
+    elseif ch_sql:upper():find("^UPDATE ") then
+        local tbl, rest = ch_sql:match("^UPDATE%s+([%w_]+)%s+SET%s+(.*)$")
+        if tbl and rest then ch_sql = "ALTER TABLE " .. tbl .. " UPDATE " .. rest end
+    elseif ch_sql:upper():find("^DELETE FROM ") then
+        local tbl, rest = ch_sql:match("^DELETE FROM%s+([%w_]+)%s+WHERE%s+(.*)$")
+        if tbl and rest then ch_sql = "ALTER TABLE " .. tbl .. " DELETE WHERE " .. rest end
+    end
+
+    local cmd = string.format(
+        '%s local --path %s --format CSVWithNames --query %s',
+        CLICKHOUSE_BIN,
+        CLICKHOUSE_DIR,
+        string.format("%q", ch_sql)
+    )
+    local handle = io.popen(cmd .. " 2>&1")
+    if not handle then return nil, "io.popen failed" end
+    local output = handle:read("*a")
+    handle:close()
+    if output:match("^Exception:") or output:match("^Code:") then
+        return nil, output:gsub("\n$", "")
+    end
+    return parse_csv_output(output)
+end
+
 for _, oracle in ipairs(active_oracles) do
     if oracle.type == "sqlite" then
         oracle.exec = sqlite_exec
@@ -185,6 +226,9 @@ for _, oracle in ipairs(active_oracles) do
     elseif oracle.type == "duckdb" then
         oracle.exec = duckdb_exec
         oracle.reset = duckdb_reset
+    elseif oracle.type == "clickhouse" then
+        oracle.exec = clickhouse_exec
+        oracle.reset = clickhouse_reset
     end
 end
 
@@ -234,38 +278,45 @@ local function normalize(v)
     return tostring(v):lower():gsub("^%s+", ""):gsub("%s+$", "")
 end
 
-local function compare_results(label, sqlite_rows, luadb_rows)
-    local sqlite_is_msg = sqlite_rows and sqlite_rows.message ~= nil
+local oracle_stats = {}
+for _, o in ipairs(active_oracles) do
+    oracle_stats[o.name] = { pass = 0, fail = 0, type = o.type }
+end
+
+local function compare_results(label, oracle, oracle_rows, luadb_rows)
+    local oracle_name = oracle.name
+    local oracle_is_msg = oracle_rows and oracle_rows.message ~= nil
     local luadb_is_msg  = luadb_rows  and luadb_rows.message  ~= nil
 
-    if sqlite_is_msg or luadb_is_msg then
-        if sqlite_rows and luadb_rows then
+    if oracle_is_msg or luadb_is_msg then
+        if oracle_rows and luadb_rows then
             PASS_COUNT = PASS_COUNT + 1
-            print(string.format("  [MATCH] %s  (DDL/DML: both engines succeeded)", label))
+            oracle_stats[oracle_name].pass = oracle_stats[oracle_name].pass + 1
+            print(string.format("  [MATCH] [%s] %s  (DDL/DML: both engines succeeded)", oracle_name, label))
         else
             FAIL_COUNT = FAIL_COUNT + 1
-            print(string.format("  [FAIL]  %s  SQLite=%s  LuaDB=%s",
-                label,
-                sqlite_rows and "ok" or "ERROR",
+            oracle_stats[oracle_name].fail = oracle_stats[oracle_name].fail + 1
+            print(string.format("  [FAIL]  [%s] %s  %s=%s  LuaDB=%s",
+                oracle_name, label, oracle_name,
+                oracle_rows and "ok" or "ERROR",
                 luadb_rows  and "ok" or "ERROR"))
         end
         return
     end
 
     -- SELECT: compare row count first
-    local sc = #sqlite_rows
+    local sc = #oracle_rows
     local lc = #luadb_rows
     if sc ~= lc then
         FAIL_COUNT = FAIL_COUNT + 1
-        print(string.format("  [FAIL]  %s  row count: SQLite=%d, LuaDB=%d", label, sc, lc))
+        oracle_stats[oracle_name].fail = oracle_stats[oracle_name].fail + 1
+        print(string.format("  [FAIL]  [%s] %s  row count: %s=%d, LuaDB=%d", oracle_name, label, oracle_name, sc, lc))
         return
     end
 
     -- Build a column name normalizer for aggregates:
-    -- SQLite outputs "COUNT(*)" header; LuaDB outputs "count_star".
-    -- We normalize both to a canonical form before comparing.
     local function norm_col(k)
-        k = k:lower()
+        k = k:lower():gsub('^"', ''):gsub('"$', '')
         k = k:gsub("count%(%)" , "count_star")
         k = k:gsub("count%(%*%)", "count_star")
         k = k:gsub("count%((.-)%)", function(c) return "count_" .. c end)
@@ -277,11 +328,10 @@ local function compare_results(label, sqlite_rows, luadb_rows)
         return k
     end
 
-    -- Compare each row field-by-field (order matters -- both engines receive same ORDER BY)
+    -- Compare each row field-by-field
     for i = 1, sc do
-        local sr = sqlite_rows[i]
+        local sr = oracle_rows[i]
         local lr = luadb_rows[i]
-        -- Re-key both rows through the normaliser so aggregate names match
         local sr_norm, lr_norm = {}, {}
         for k, v in pairs(sr) do sr_norm[norm_col(k)] = v end
         for k, v in pairs(lr) do lr_norm[norm_col(k)] = v end
@@ -289,16 +339,18 @@ local function compare_results(label, sqlite_rows, luadb_rows)
             local lv = lr_norm[k]
             if normalize(sv) ~= normalize(lv) then
                 FAIL_COUNT = FAIL_COUNT + 1
+                oracle_stats[oracle_name].fail = oracle_stats[oracle_name].fail + 1
                 print(string.format(
-                    "  [FAIL]  %s  row[%d].%s: SQLite=%q, LuaDB=%q",
-                    label, i, k, tostring(sv), tostring(lv)))
+                    "  [FAIL]  [%s] %s  row[%d].%s: %s=%q, LuaDB=%q",
+                    oracle_name, label, i, k, oracle_name, tostring(sv), tostring(lv)))
                 return
             end
         end
     end
 
     PASS_COUNT = PASS_COUNT + 1
-    print(string.format("  [MATCH] %s  (%d row(s) identical)", label, sc))
+    oracle_stats[oracle_name].pass = oracle_stats[oracle_name].pass + 1
+    print(string.format("  [MATCH] [%s] %s  (%d row(s) identical)", oracle_name, label, sc))
 end
 
 local function both(label, sql)
@@ -313,10 +365,11 @@ local function both(label, sql)
         local sr, se = oracle.exec(sql)
         if se and not sr then
             FAIL_COUNT = FAIL_COUNT + 1
-            print(string.format("  [FAIL]  %s  %s error: %s", label, oracle.name, se))
-            return
+            oracle_stats[oracle.name].fail = oracle_stats[oracle.name].fail + 1
+            print(string.format("  [FAIL]  [%s] %s  %s error: %s", oracle.name, label, oracle.name, se))
+        else
+            compare_results(label, oracle, sr, lr)
         end
-        compare_results(label, sr, lr)
     end
 end
 
@@ -600,9 +653,29 @@ os.remove(LUADB_DB_LOCAL)
 
 -- Summary
 local TOTAL = PASS_COUNT + FAIL_COUNT
-print(string.format("\n=================================================="))
-print(string.format("  Dark Room Results: %d/%d MATCH  |  %d FAIL", PASS_COUNT, TOTAL, FAIL_COUNT))
-print(string.format("=================================================="))
+local overall_pct = TOTAL > 0 and (PASS_COUNT / TOTAL * 100) or 0.0
+
+print("\n========================================================================================")
+print("                      DARK ROOM MULTI-ORACLE CONFORMANCE MATRIX                          ")
+print("========================================================================================")
+print(string.format(" %-24s %-18s %-12s %-8s %-8s %-8s", "Oracle Technology", "Engine Type", "Total Tests", "MATCH", "FAIL", "Match %"))
+print("----------------------------------------------------------------------------------------")
+
+for _, oracle in ipairs(active_oracles) do
+    local st = oracle_stats[oracle.name]
+    local total = st.pass + st.fail
+    local pct = total > 0 and (st.pass / total * 100) or 0.0
+    local engine_desc = "Embedded RDBMS"
+    if oracle.type == "duckdb" then engine_desc = "Embedded OLAP"
+    elseif oracle.type == "clickhouse" then engine_desc = "Columnar OLAP" end
+
+    print(string.format(" %-24s %-18s %-12d %-8d %-8d %6.1f%%",
+        oracle.name, engine_desc, total, st.pass, st.fail, pct))
+end
+
+print("----------------------------------------------------------------------------------------")
+print(string.format(" Overall Conformance: %d/%d MATCH (%0.1f%% Byte-Identical Output)", PASS_COUNT, TOTAL, overall_pct))
+print("========================================================================================\n")
 
 if FAIL_COUNT > 0 then
     error(string.format("[DARK ROOM FAIL] %d divergence(s) detected vs external oracles.", FAIL_COUNT))
