@@ -251,7 +251,7 @@ SQLITE_BIN=sqlite3 lua tests/darkroom_spec.lua
 - **Oracle**: SQLite 3 binary (`SQLITE_BIN` env var or PATH — zero LuaDB code in oracle path)
 - **Subject**: LuaDB embedded API (treated as a pure black box)
 - **Method**: Identical SQL fired at both engines; results compared row-by-row, field-by-field
-- **Result**: `50/50 MATCH — LuaDB output is byte-identical to SQLite on all 50 test cases`
+- **Result**: `62/62 MATCH — LuaDB output is byte-identical to SQLite on all 62 test cases`
 
 ---
 

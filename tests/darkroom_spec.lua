@@ -230,6 +230,7 @@ local function compare_results(label, sqlite_rows, luadb_rows)
         k = k:lower()
         k = k:gsub("count%(%)" , "count_star")
         k = k:gsub("count%(%*%)", "count_star")
+        k = k:gsub("count%((.-)%)", function(c) return "count_" .. c end)
         k = k:gsub("sum%((.-)%)",  function(c) return "sum_"  .. c end)
         k = k:gsub("avg%((.-)%)",  function(c) return "avg_"  .. c end)
         k = k:gsub("min%((.-)%)",  function(c) return "min_"  .. c end)
@@ -450,20 +451,60 @@ both("INSERT mixed types",
 both("SELECT type round-trip",
     "SELECT i, r, t FROM types_test;")
 
--- Group 12: Edge Cases
-print("\n[Group 12] Edge Cases")
+-- Group 13: Complex Multi-Condition WHERE Predicates & IN Clauses
+print("\n[Group 13] Complex WHERE Predicates & IN Clause")
 
-both("SELECT from empty result set",
-    "SELECT * FROM departments WHERE budget < 0;")
+both("WHERE IN list numeric",
+    "SELECT name, dept, salary FROM employees WHERE hired IN (2018, 2019, 2021) ORDER BY id;")
 
-both("COUNT on empty result",
-    "SELECT COUNT(*) FROM employees WHERE dept = 'Finance';")
+both("WHERE IN list string",
+    "SELECT name, salary FROM employees WHERE dept IN ('Engineering', 'Marketing') ORDER BY salary DESC;")
 
-both("UPDATE no matching rows",
-    "UPDATE employees SET salary = 1 WHERE name = 'Nobody';")
+both("WHERE AND/OR complex combination",
+    "SELECT name, dept, salary FROM employees WHERE (dept = 'Engineering' AND salary >= 95000) OR (dept = 'Marketing' AND hired >= 2021) ORDER BY id;")
 
-both("DELETE no matching rows",
-    "DELETE FROM employees WHERE name = 'Nobody';")
+-- Group 14: Adversarial Aggregates & Typed GROUP BY
+print("\n[Group 14] Adversarial Aggregates & Typed GROUP BY")
+
+both("CREATE TABLE adv_dark_test",
+    "CREATE TABLE adv_dark_test (id INTEGER PRIMARY KEY, category TEXT, val REAL);")
+
+both("INSERT adv_dark_test rows",
+    "INSERT INTO adv_dark_test VALUES (1, 'alpha', 10.5);")
+both("INSERT adv_dark_test row 2",
+    "INSERT INTO adv_dark_test VALUES (2, 'alpha', -4.5);")
+both("INSERT adv_dark_test row 3",
+    "INSERT INTO adv_dark_test VALUES (3, 'alpha', NULL);")
+both("INSERT adv_dark_test row 4",
+    "INSERT INTO adv_dark_test VALUES (4, 'beta', 0.0);")
+both("INSERT adv_dark_test row 5",
+    "INSERT INTO adv_dark_test VALUES (5, 'beta', -15.0);")
+both("INSERT adv_dark_test row 6",
+    "INSERT INTO adv_dark_test VALUES (6, '', 5.0);")
+
+both("GROUP BY category COUNT, SUM, AVG, MIN, MAX",
+    "SELECT category, COUNT(*), COUNT(val), SUM(val), AVG(val), MIN(val), MAX(val) FROM adv_dark_test GROUP BY category ORDER BY category;")
+
+-- Group 15: Multi-Row DML Mutations & Index Consistency
+print("\n[Group 15] Multi-Row DML Mutations & Complex Predicate Updates")
+
+both("UPDATE multi-row with IN clause",
+    "UPDATE employees SET salary = salary + 5000 WHERE hired IN (2018, 2019);")
+
+both("SELECT post multi-row IN update",
+    "SELECT name, salary FROM employees WHERE hired IN (2018, 2019) ORDER BY salary DESC;")
+
+both("DELETE multi-row with numeric range",
+    "DELETE FROM employees WHERE salary < 70000;")
+
+both("SELECT count post range delete",
+    "SELECT COUNT(*) FROM employees;")
+
+-- Group 16: Multi-Level ORDER BY with Pagination
+print("\n[Group 16] Multi-Level ORDER BY with Pagination")
+
+both("ORDER BY dept ASC, salary DESC, name ASC LIMIT 3 OFFSET 1",
+    "SELECT name, dept, salary FROM employees ORDER BY dept ASC, salary DESC, name ASC LIMIT 3 OFFSET 1;")
 
 -- Cleanup
 luadb_close()

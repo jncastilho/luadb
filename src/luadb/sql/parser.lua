@@ -85,6 +85,19 @@ function parser._parse_tokens(tokens, sql, params)
     end
 
     local function parse_expression()
+        if match_symbol("(") then
+            local expr = parse_expression()
+            if not match_symbol(")") then error("Expected ')' after parenthesized expression") end
+            if match_keyword("AND") then
+                local next_expr = parse_expression()
+                return { type = "AND", left = expr, right = next_expr }
+            elseif match_keyword("OR") then
+                local next_expr = parse_expression()
+                return { type = "OR", left = expr, right = next_expr }
+            end
+            return expr
+        end
+
         local left_ident = expect_identifier()
         local path_keys = {}
         local as_text = false
@@ -104,8 +117,42 @@ function parser._parse_tokens(tokens, sql, params)
         if match_keyword("IS") then
             local is_not = match_keyword("NOT")
             if match_keyword("NULL") then
-                return { left = left_node, op = is_not and "IS NOT NULL" or "IS NULL", right = nil }
+                local expr = { left = left_node, op = is_not and "IS NOT NULL" or "IS NULL", right = nil }
+                if match_keyword("AND") then
+                    local next_expr = parse_expression()
+                    return { type = "AND", left = expr, right = next_expr }
+                elseif match_keyword("OR") then
+                    local next_expr = parse_expression()
+                    return { type = "OR", left = expr, right = next_expr }
+                end
+                return expr
             end
+        end
+
+        if match_keyword("IN") then
+            if not match_symbol("(") then error("Expected '(' after IN") end
+            local in_vals = {}
+            repeat
+                local v = consume()
+                if v and v.type == "SYMBOL" and v.value == "-" then
+                    local next_v = consume()
+                    if next_v and next_v.type == "NUMBER" then v = { type = "NUMBER", value = -next_v.value } end
+                end
+                if v and (v.type == "NUMBER" or v.type == "STRING" or v.type == "IDENTIFIER" or v.type == "KEYWORD") then
+                    table.insert(in_vals, v.value)
+                end
+                if not match_symbol(",") then break end
+            until false
+            if not match_symbol(")") then error("Expected ')' after IN list") end
+            local expr = { left = left_node, op = "IN", right = in_vals }
+            if match_keyword("AND") then
+                local next_expr = parse_expression()
+                return { type = "AND", left = expr, right = next_expr }
+            elseif match_keyword("OR") then
+                local next_expr = parse_expression()
+                return { type = "OR", left = expr, right = next_expr }
+            end
+            return expr
         end
 
         local op_token = consume()
@@ -539,8 +586,20 @@ function parser._parse_tokens(tokens, sql, params)
             local col = expect_identifier()
             local eq = consume()
             if not eq or (eq.type ~= "OPERATOR" and eq.value ~= "=") then error("Expected '=' in SET") end
-            local val = consume()
-            table.insert(set_assignments, { column = col, value = val.value })
+            local left_tok = consume()
+            local op_tok = peek()
+            if op_tok and op_tok.type == "SYMBOL" and (op_tok.value == "+" or op_tok.value == "-") then
+                local op = consume().value
+                local right_tok = consume()
+                table.insert(set_assignments, {
+                    column = col,
+                    expr = { left = left_tok.value, op = op, right = right_tok.value }
+                })
+            else
+                local val_to_store = left_tok.value
+                if left_tok.type == "KEYWORD" and left_tok.value:upper() == "NULL" then val_to_store = nil end
+                table.insert(set_assignments, { column = col, value = val_to_store })
+            end
             if not match_symbol(",") then break end
         until false
 

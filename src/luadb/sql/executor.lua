@@ -759,8 +759,8 @@ function executor:execute(ast)
                         for k, v in pairs(a) do if k:lower() == col_name then a_val = v break end end
                         for k, v in pairs(b) do if k:lower() == col_name then b_val = v break end end
                         if a_val ~= b_val then
-                            if a_val == nil then return desc end
-                            if b_val == nil then return not desc end
+                            if a_val == nil then return not desc end
+                            if b_val == nil then return desc end
                             if type(a_val) ~= type(b_val) then a_val = tostring(a_val); b_val = tostring(b_val) end
                             if desc then return a_val > b_val else return a_val < b_val end
                         end
@@ -861,8 +861,8 @@ function executor:execute(ast)
                     local a_val = cidx and ra[cidx] or nil
                     local b_val = cidx and rb[cidx] or nil
                     if a_val ~= b_val then
-                        if a_val == nil then return desc end
-                        if b_val == nil then return not desc end
+                        if a_val == nil then return not desc end
+                        if b_val == nil then return desc end
                         if type(a_val) ~= type(b_val) then
                             a_val = tostring(a_val)
                             b_val = tostring(b_val)
@@ -922,8 +922,8 @@ function executor:execute(ast)
                         if k:lower() == col_name then b_val = v break end
                     end
                     if a_val ~= b_val then
-                        if a_val == nil then return desc end
-                        if b_val == nil then return not desc end
+                        if a_val == nil then return not desc end
+                        if b_val == nil then return desc end
                         if type(a_val) ~= type(b_val) then
                             a_val = tostring(a_val)
                             b_val = tostring(b_val)
@@ -976,7 +976,17 @@ function executor:execute(ast)
                 for _, assign in ipairs(ast.assignments) do
                     for idx, col in ipairs(meta.columns) do
                         if col.name:lower() == assign.column:lower() then
-                            row[idx] = assign.value
+                            if assign.expr then
+                                local cur_v = row[idx] or 0
+                                local r_v = tonumber(assign.expr.right) or 0
+                                if assign.expr.op == "+" then
+                                    row[idx] = cur_v + r_v
+                                elseif assign.expr.op == "-" then
+                                    row[idx] = cur_v - r_v
+                                end
+                            else
+                                row[idx] = assign.value
+                            end
                         end
                     end
                 end
@@ -1184,6 +1194,17 @@ function executor:_eval_where(where, row, columns)
             local ltarget = tostring(target):lower()
             local pattern = "^" .. ltarget:gsub("%%", ".*"):gsub("_", ".") .. "$"
             return string.match(lval, pattern) ~= nil
+        elseif op == "IN" then
+            if val == nil or type(where.right) ~= "table" then return false end
+            for _, item in ipairs(where.right) do
+                if val == item then return true end
+                if type(val) ~= type(item) then
+                    local num_v, num_item = tonumber(val), tonumber(item)
+                    if num_v and num_item and num_v == num_item then return true end
+                    if tostring(val) == tostring(item) then return true end
+                end
+            end
+            return false
         elseif op == "IS NULL" then
             return val == nil
         elseif op == "IS NOT NULL" then
