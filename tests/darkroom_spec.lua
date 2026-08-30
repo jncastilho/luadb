@@ -18,15 +18,16 @@ package.path = "src/?.lua;src/?/init.lua;" .. package.path
 -- We pipe SQL to sqlite3 using io.popen and parse CSV output.
 -- No LuaDB code is involved at all in the Oracle path.
 
-local function find_sqlite_bin()
-    local env_bin = os.getenv("SQLITE_BIN")
-    local candidates = env_bin and { env_bin } or { "sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/opt/homebrew/bin/sqlite3" }
-    for _, bin in ipairs(candidates) do
+local function find_cli_bin(env_var, candidates)
+    local env_bin = os.getenv(env_var)
+    local list = env_bin and { env_bin } or candidates
+    for _, bin in ipairs(list) do
         local handle = io.popen(string.format('%s --version 2>&1', bin))
         if handle then
             local out = handle:read("*a")
             handle:close()
-            if out and not out:find("not found") and not out:find("is not recognized") and #out > 0 then
+            local lout = (out or ""):lower()
+            if #lout > 0 and not lout:find("not found") and not lout:find("no such file") and not lout:find("is not recognized") and not lout:find("cannot access") then
                 return bin
             end
         end
@@ -34,49 +35,80 @@ local function find_sqlite_bin()
     return nil
 end
 
-local SQLITE_BIN = find_sqlite_bin()
+local active_oracles = {}
 
-if not SQLITE_BIN then
+local SQLITE_BIN = find_cli_bin("SQLITE_BIN", { "sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/opt/homebrew/bin/sqlite3" })
+if SQLITE_BIN then
+    table.insert(active_oracles, { name = "SQLite 3", bin = SQLITE_BIN, type = "sqlite" })
+end
+
+local DUCKDB_BIN = find_cli_bin("DUCKDB_BIN", { "duckdb", "/usr/bin/duckdb", "/usr/local/bin/duckdb" })
+if DUCKDB_BIN then
+    table.insert(active_oracles, { name = "DuckDB", bin = DUCKDB_BIN, type = "duckdb" })
+end
+
+if #active_oracles == 0 then
     print("\n==================================================")
     print("  LuaDB Dark Room: Conformance Test (SKIPPED)")
     print("==================================================")
-    print("  [SKIP] sqlite3 binary not found on PATH or SQLITE_BIN.")
-    print("  To run this suite, install sqlite3 or set SQLITE_BIN=/path/to/sqlite3")
+    print("  [SKIP] No external database CLI oracle (sqlite3, duckdb) found.")
+    print("  To run this suite, install sqlite3 or duckdb.")
     print("==================================================\n")
     return
 end
 
 local tmp_dir = os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"
-local SQLITE_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_oracle.db"
+local SQLITE_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_sqlite.db"
+local DUCKDB_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_duckdb.db"
 local LUADB_DB_LOCAL = "darkroom_subject.db"  -- relative to cwd (luadb root)
 
 local function sqlite_reset()
     os.remove(SQLITE_DB)
 end
 
--- Execute SQL against the SQLite oracle. Returns rows as array of key=value tables.
--- For DML/DDL, returns {message = "ok"} on success.
-local function sqlite_exec(sql)
-    local cmd = string.format(
-        '%s -csv -header %s %s',
-        SQLITE_BIN,
-        SQLITE_DB,
-        string.format("%q", sql)
-    )
-    local handle = io.popen(cmd .. " 2>&1")
-    if not handle then
-        return nil, "io.popen failed"
-    end
-    local output = handle:read("*a")
-    handle:close()
+local function duckdb_reset()
+    os.remove(DUCKDB_DB)
+end
 
-    if output:match("^Error:") or output:match("^Parse error:") then
-        return nil, output:gsub("\n$", "")
+local function csv_fields(line)
+    local fields = {}
+    local pos = 1
+    while pos <= #line do
+        if line:sub(pos, pos) == '"' then
+            pos = pos + 1
+            local val = ""
+            while pos <= #line do
+                local ch = line:sub(pos, pos)
+                if ch == '"' then
+                    if line:sub(pos + 1, pos + 1) == '"' then
+                        val = val .. '"'
+                        pos = pos + 2
+                    else
+                        pos = pos + 1
+                        break
+                    end
+                else
+                    val = val .. ch
+                    pos = pos + 1
+                end
+            end
+            table.insert(fields, val)
+            if line:sub(pos, pos) == "," then pos = pos + 1 end
+        else
+            local s = pos
+            while pos <= #line and line:sub(pos, pos) ~= "," do
+                pos = pos + 1
+            end
+            table.insert(fields, line:sub(s, pos - 1))
+            if line:sub(pos, pos) == "," then pos = pos + 1 end
+        end
     end
+    return fields
+end
 
+local function parse_csv_output(output)
     local lines = {}
     for raw_line in output:gmatch("[^\n]+") do
-        -- Strip Windows-style CR that sqlite3 may emit on Linux
         local line = raw_line:gsub("\r", "")
         if line ~= "" then
             table.insert(lines, line)
@@ -98,47 +130,8 @@ local function sqlite_exec(sql)
 
     local rows = {}
     for i = 2, #lines do
-        local row = {}
-        -- Proper RFC-4180 CSV field parser (handles "quoted, fields" from sqlite3)
-        local function csv_fields(line)
-            local fields = {}
-            local pos = 1
-            while pos <= #line do
-                if line:sub(pos, pos) == '"' then
-                    -- Quoted field
-                    pos = pos + 1
-                    local val = ""
-                    while pos <= #line do
-                        local ch = line:sub(pos, pos)
-                        if ch == '"' then
-                            if line:sub(pos + 1, pos + 1) == '"' then
-                                val = val .. '"'
-                                pos = pos + 2
-                            else
-                                pos = pos + 1
-                                break
-                            end
-                        else
-                            val = val .. ch
-                            pos = pos + 1
-                        end
-                    end
-                    table.insert(fields, val)
-                    if line:sub(pos, pos) == "," then pos = pos + 1 end
-                else
-                    -- Unquoted field: read until comma or end
-                    local s = pos
-                    while pos <= #line and line:sub(pos, pos) ~= "," do
-                        pos = pos + 1
-                    end
-                    table.insert(fields, line:sub(s, pos - 1))
-                    if line:sub(pos, pos) == "," then pos = pos + 1 end
-                end
-            end
-            return fields
-        end
-
         local vals = csv_fields(lines[i])
+        local row = {}
         for col_idx, h in ipairs(headers) do
             local val = vals[col_idx] or ""
             local num = tonumber(val)
@@ -148,6 +141,50 @@ local function sqlite_exec(sql)
     end
 
     return rows
+end
+
+local function sqlite_exec(sql)
+    local cmd = string.format(
+        '%s -csv -header %s %s',
+        SQLITE_BIN,
+        SQLITE_DB,
+        string.format("%q", sql)
+    )
+    local handle = io.popen(cmd .. " 2>&1")
+    if not handle then return nil, "io.popen failed" end
+    local output = handle:read("*a")
+    handle:close()
+    if output:match("^Error:") or output:match("^Parse error:") then
+        return nil, output:gsub("\n$", "")
+    end
+    return parse_csv_output(output)
+end
+
+local function duckdb_exec(sql)
+    local cmd = string.format(
+        '%s -csv -header %s %s',
+        DUCKDB_BIN,
+        DUCKDB_DB,
+        string.format("%q", sql)
+    )
+    local handle = io.popen(cmd .. " 2>&1")
+    if not handle then return nil, "io.popen failed" end
+    local output = handle:read("*a")
+    handle:close()
+    if output:match("^Error:") or output:match("^Parse error:") or output:match("^Catalog Error:") then
+        return nil, output:gsub("\n$", "")
+    end
+    return parse_csv_output(output)
+end
+
+for _, oracle in ipairs(active_oracles) do
+    if oracle.type == "sqlite" then
+        oracle.exec = sqlite_exec
+        oracle.reset = sqlite_reset
+    elseif oracle.type == "duckdb" then
+        oracle.exec = duckdb_exec
+        oracle.reset = duckdb_reset
+    end
 end
 
 -- Subject: LuaDB (embedded public API only)
@@ -263,33 +300,41 @@ local function compare_results(label, sqlite_rows, luadb_rows)
 end
 
 local function both(label, sql)
-    local sr, se = sqlite_exec(sql)
     local lr, le = luadb_exec(sql)
-    if se and not sr then
-        FAIL_COUNT = FAIL_COUNT + 1
-        print(string.format("  [FAIL]  %s  SQLite error: %s", label, se))
-        return
-    end
     if le and not lr then
         FAIL_COUNT = FAIL_COUNT + 1
         print(string.format("  [FAIL]  %s  LuaDB error: %s", label, le))
         return
     end
-    compare_results(label, sr, lr)
+
+    for _, oracle in ipairs(active_oracles) do
+        local sr, se = oracle.exec(sql)
+        if se and not sr then
+            FAIL_COUNT = FAIL_COUNT + 1
+            print(string.format("  [FAIL]  %s  %s error: %s", label, oracle.name, se))
+            return
+        end
+        compare_results(label, sr, lr)
+    end
 end
 
 -- =============================================================================
 -- DARK ROOM TEST BATTERY
 -- =============================================================================
 
+local oracle_names = {}
+for _, o in ipairs(active_oracles) do table.insert(oracle_names, o.name .. " (" .. o.bin .. ")") end
+
 print("\n==================================================")
-print("  LuaDB Dark Room: Conformance vs SQLite Oracle")
+print("  LuaDB Dark Room: Conformance vs External Oracles")
 print("==================================================")
-print("  Oracle  : " .. SQLITE_BIN)
-print("  Subject : LuaDB embedded (black-box API)")
+print("  Active Oracles : " .. table.concat(oracle_names, ", "))
+print("  Subject        : LuaDB embedded (black-box API)")
 print("==================================================")
 
-sqlite_reset()
+for _, oracle in ipairs(active_oracles) do
+    if oracle.reset then oracle.reset() end
+end
 luadb_open()
 
 -- Group 1: Schema Creation
@@ -506,9 +551,48 @@ print("\n[Group 16] Multi-Level ORDER BY with Pagination")
 both("ORDER BY dept ASC, salary DESC, name ASC LIMIT 3 OFFSET 1",
     "SELECT name, dept, salary FROM employees ORDER BY dept ASC, salary DESC, name ASC LIMIT 3 OFFSET 1;")
 
+-- Group 17: CTE (Common Table Expressions) & Aggregations
+print("\n[Group 17] WITH CTE & Regional Aggregations")
+
+both("CREATE TABLE sales_dark",
+    "CREATE TABLE sales_dark (id INTEGER PRIMARY KEY, region TEXT, amount REAL);")
+both("INSERT sales 1", "INSERT INTO sales_dark VALUES (1, 'North', 1500.0);")
+both("INSERT sales 2", "INSERT INTO sales_dark VALUES (2, 'North', 2500.0);")
+both("INSERT sales 3", "INSERT INTO sales_dark VALUES (3, 'South', 800.0);")
+both("INSERT sales 4", "INSERT INTO sales_dark VALUES (4, 'South', 1200.0);")
+
+both("WITH CTE regional summary query",
+    "WITH reg_summary AS (SELECT region, COUNT(*) AS sales_cnt, SUM(amount) AS total_amt FROM sales_dark GROUP BY region) SELECT * FROM reg_summary ORDER BY region;")
+
+-- Group 18: Dynamic Grouping & Multi-Column Aggregates
+print("\n[Group 18] Dynamic Grouping & Multi-Column Aggregates")
+
+both("SELECT region, total sum",
+    "SELECT region, SUM(amount) FROM sales_dark GROUP BY region ORDER BY region;")
+
+-- Group 19: Complex DML Updates & Arithmetic Operations
+print("\n[Group 19] Complex DML Updates & Range Math")
+
+both("UPDATE sales region South",
+    "UPDATE sales_dark SET amount = amount + 500 WHERE region = 'South';")
+
+both("SELECT post UPDATE sales South",
+    "SELECT region, amount FROM sales_dark WHERE region = 'South' ORDER BY id;")
+
+-- Group 20: Range Deletions & Count Aggregations
+print("\n[Group 20] Dynamic Range Deletions & Final Count")
+
+both("DELETE sales low amount",
+    "DELETE FROM sales_dark WHERE amount < 1500;")
+
+both("SELECT post DELETE sales count",
+    "SELECT COUNT(*) FROM sales_dark;")
+
 -- Cleanup
 luadb_close()
-sqlite_reset()
+for _, oracle in ipairs(active_oracles) do
+    if oracle.reset then oracle.reset() end
+end
 luadb_reset()
 os.remove(LUADB_DB_LOCAL)
 
@@ -519,7 +603,7 @@ print(string.format("  Dark Room Results: %d/%d MATCH  |  %d FAIL", PASS_COUNT, 
 print(string.format("=================================================="))
 
 if FAIL_COUNT > 0 then
-    error(string.format("[DARK ROOM FAIL] %d divergence(s) detected vs SQLite oracle.", FAIL_COUNT))
+    error(string.format("[DARK ROOM FAIL] %d divergence(s) detected vs external oracles.", FAIL_COUNT))
 else
-    print("  [OK] LuaDB output is byte-identical to SQLite on all " .. TOTAL .. " test cases.\n")
+    print("  [OK] LuaDB output is byte-identical across all Oracles on all " .. TOTAL .. " test cases.\n")
 end

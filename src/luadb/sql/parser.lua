@@ -423,7 +423,13 @@ function parser._parse_tokens(tokens, sql, params)
                         target_col = expect_identifier()
                     end
                     if not match_symbol(")") then error("Expected ')' after aggregate target") end
-                    table.insert(projections, { type = "AGGREGATE", func = agg_type, column = target_col })
+                    local alias = nil
+                    if match_keyword("AS") then
+                        alias = expect_identifier()
+                    elseif peek() and peek().type == "IDENTIFIER" and peek().value:upper() ~= "FROM" and peek().value:upper() ~= "WHERE" and peek().value:upper() ~= "GROUP" and peek().value:upper() ~= "ORDER" and peek().value ~= "," then
+                        alias = consume().value
+                    end
+                    table.insert(projections, { type = "AGGREGATE", func = agg_type, column = target_col, alias = alias })
                 else
                     local tok = consume()
                     if not tok then error("Unexpected EOF in SELECT projection") end
@@ -445,6 +451,11 @@ function parser._parse_tokens(tokens, sql, params)
                         end
                         match_symbol(")")
                         col_name = col_name .. "(" .. func_args .. ")"
+                    end
+
+                    local alias = nil
+                    if match_keyword("AS") then
+                        alias = expect_identifier()
                     end
 
                     local path_keys = {}

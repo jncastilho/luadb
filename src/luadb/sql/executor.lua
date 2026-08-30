@@ -387,6 +387,20 @@ function executor:execute(ast)
             return { record }
         end
 
+        local clean_table = ast.table and ast.table:match("([^%.]+)$") or ast.table
+        local meta = self.catalog[ast.table] or self.catalog[clean_table]
+        if meta and meta.transient_rows then
+            local t_rows = meta.transient_rows
+            if ast.cte then
+                if cte_backup then
+                    self.catalog[ast.cte.name] = cte_backup
+                else
+                    self.catalog[ast.cte.name] = nil
+                end
+            end
+            return t_rows
+        end
+
         if ast.table and (ast.table:lower():find("pg_") or ast.table:lower():find("unnest")) then
             local tbl_lower = ast.table:lower()
             local raw_catalog_rows = {}
