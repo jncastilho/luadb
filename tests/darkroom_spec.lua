@@ -53,6 +53,18 @@ if CLICKHOUSE_BIN then
     table.insert(active_oracles, { name = "ClickHouse Local", bin = CLICKHOUSE_BIN, type = "clickhouse" })
 end
 
+local PSQL_BIN = find_cli_bin("PSQL_BIN", { "psql", "/usr/bin/psql", "/usr/local/bin/psql" })
+if PSQL_BIN then
+    local pcheck = io.popen(PSQL_BIN .. " -h /tmp -p 5433 -U postgres --csv -c 'SELECT 1;' 2>&1")
+    if pcheck then
+        local pout = pcheck:read("*a")
+        pcheck:close()
+        if pout and pout:find("1") then
+            table.insert(active_oracles, { name = "PostgreSQL 18", bin = PSQL_BIN, type = "postgres" })
+        end
+    end
+end
+
 if #active_oracles == 0 then
     print("\n==================================================")
     print("  LuaDB Dark Room: Conformance Test (SKIPPED)")
@@ -219,6 +231,28 @@ local function clickhouse_exec(sql)
     return parse_csv_output(output)
 end
 
+local function psql_reset()
+    if PSQL_BIN then
+        os.execute(string.format('%s -h /tmp -p 5433 -U postgres -c "DROP TABLE IF EXISTS employees, departments, types_test, adv_dark_test, sales_dark CASCADE;" >/dev/null 2>&1', PSQL_BIN))
+    end
+end
+
+local function psql_exec(sql)
+    local cmd = string.format(
+        '%s -h /tmp -p 5433 -U postgres --csv -c %s',
+        PSQL_BIN,
+        string.format("%q", sql)
+    )
+    local handle = io.popen(cmd .. " 2>&1")
+    if not handle then return nil, "io.popen failed" end
+    local output = handle:read("*a")
+    handle:close()
+    if output:match("^ERROR:") or output:match("^FATAL:") then
+        return nil, output:gsub("\n$", "")
+    end
+    return parse_csv_output(output)
+end
+
 for _, oracle in ipairs(active_oracles) do
     if oracle.type == "sqlite" then
         oracle.exec = sqlite_exec
@@ -229,6 +263,9 @@ for _, oracle in ipairs(active_oracles) do
     elseif oracle.type == "clickhouse" then
         oracle.exec = clickhouse_exec
         oracle.reset = clickhouse_reset
+    elseif oracle.type == "postgres" then
+        oracle.exec = psql_exec
+        oracle.reset = psql_reset
     end
 end
 
@@ -317,6 +354,11 @@ local function compare_results(label, oracle, oracle_rows, luadb_rows)
     -- Build a column name normalizer for aggregates:
     local function norm_col(k)
         k = k:lower():gsub('^"', ''):gsub('"$', '')
+        k = k:gsub("^count$", "count_star")
+        k = k:gsub("^sum$", "sum_val")
+        k = k:gsub("^avg$", "avg_val")
+        k = k:gsub("^min$", "min_val")
+        k = k:gsub("^max$", "max_val")
         k = k:gsub("count%(%)" , "count_star")
         k = k:gsub("count%(%*%)", "count_star")
         k = k:gsub("count%((.-)%)", function(c) return "count_" .. c end)
@@ -667,7 +709,8 @@ for _, oracle in ipairs(active_oracles) do
     local pct = total > 0 and (st.pass / total * 100) or 0.0
     local engine_desc = "Embedded RDBMS"
     if oracle.type == "duckdb" then engine_desc = "Embedded OLAP"
-    elseif oracle.type == "clickhouse" then engine_desc = "Columnar OLAP" end
+    elseif oracle.type == "clickhouse" then engine_desc = "Columnar OLAP"
+    elseif oracle.type == "postgres" then engine_desc = "Server RDBMS" end
 
     print(string.format(" %-24s %-18s %-12d %-8d %-8d %6.1f%%",
         oracle.name, engine_desc, total, st.pass, st.fail, pct))
