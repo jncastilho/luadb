@@ -181,6 +181,7 @@ local function parse_csv_output(output)
         local row = {}
         for col_idx, h in ipairs(headers) do
             local val = vals[col_idx] or ""
+            if val == "\\N" then val = "" end
             local num = tonumber(val)
             row[h] = num ~= nil and num or val
         end
@@ -231,21 +232,39 @@ end
 
 local function clickhouse_exec(sql)
     local ch_sql = sql
-    if ch_sql:upper():find("^CREATE TABLE ") and not ch_sql:upper():find("ENGINE%s*=") then
+    local upper = ch_sql:upper()
+    local trimmed = upper:match("^%s*(.-)%s*$") or upper
+    local is_select = trimmed:find("^SELECT") == 1 or trimmed:find("^WITH") == 1
+
+    if trimmed:find("^CREATE TABLE") == 1 and not upper:find("ENGINE%s*=") then
         ch_sql = ch_sql:gsub("PRIMARY KEY", "")
-        ch_sql = ch_sql:gsub(";%s*$", "") .. " ENGINE = StripeLog;"
-    elseif ch_sql:upper():find("^UPDATE ") then
-        local tbl, rest = ch_sql:match("^UPDATE%s+([%w_]+)%s+SET%s+(.*)$")
-        if tbl and rest then ch_sql = "ALTER TABLE " .. tbl .. " UPDATE " .. rest end
-    elseif ch_sql:upper():find("^DELETE FROM ") then
-        local tbl, rest = ch_sql:match("^DELETE FROM%s+([%w_]+)%s+WHERE%s+(.*)$")
-        if tbl and rest then ch_sql = "ALTER TABLE " .. tbl .. " DELETE WHERE " .. rest end
+        ch_sql = ch_sql:gsub(";%s*$", "") .. " ENGINE = MergeTree ORDER BY tuple();"
+    elseif trimmed:find("^UPDATE") == 1 then
+        local tbl, rest = ch_sql:match("^%s*UPDATE%s+([%w_]+)%s+SET%s+(.*)$")
+        if tbl and rest then
+            rest = rest:gsub(";%s*$", "")
+            if not rest:upper():find("WHERE") then
+                rest = rest .. " WHERE 1"
+            end
+            ch_sql = "ALTER TABLE " .. tbl .. " UPDATE " .. rest .. " SETTINGS mutations_sync = 2;"
+        end
+    elseif trimmed:find("^DELETE FROM") == 1 then
+        local tbl, rest = ch_sql:match("^%s*DELETE FROM%s+([%w_]+)%s*(.*)$")
+        if tbl then
+            rest = (rest or ""):gsub(";%s*$", "")
+            if rest == "" or not rest:upper():find("WHERE") then
+                rest = "WHERE 1"
+            end
+            ch_sql = "ALTER TABLE " .. tbl .. " DELETE " .. rest .. " SETTINGS mutations_sync = 2;"
+        end
     end
 
+    local format_flag = is_select and "--format CSVWithNames" or ""
     local cmd = string.format(
-        '%s local --path %s --format CSVWithNames --query %s',
+        '%s local --path %s --data_type_default_nullable=1 %s --query %s',
         CLICKHOUSE_BIN,
         CLICKHOUSE_DIR,
+        format_flag,
         string.format("%q", ch_sql)
     )
     local handle = io.popen(cmd .. " 2>&1")
@@ -254,6 +273,9 @@ local function clickhouse_exec(sql)
     handle:close()
     if output:match("^Exception:") or output:match("^Code:") then
         return nil, output:gsub("\n$", "")
+    end
+    if not is_select then
+        return { message = "ok" }
     end
     return parse_csv_output(output)
 end

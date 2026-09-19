@@ -10,6 +10,7 @@ function executor.new(wal)
     self.wal = wal
     self.catalog = {} -- table_name -> { root_page_id, columns, auto_inc, indexes }
     self.indexes = {} -- index_name -> { table_name, column_name, root_page_id }
+    self.freelist = {} -- list of freed page_ids available for reuse
     self.next_page_id = 2
     self._catalog_dirty = false -- tracks whether auto_inc needs flushing
 
@@ -24,11 +25,24 @@ function executor.new(wal)
     return self
 end
 
+function executor:_allocate_page()
+    if #self.freelist > 0 then
+        local pid = table.remove(self.freelist)
+        self._catalog_dirty = true
+        if self.wal and self.wal.write_page then
+            self.wal:write_page(pid, page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF))
+        end
+        return pid
+    end
+    local pid = self.next_page_id
+    self.next_page_id = self.next_page_id + 1
+    self._catalog_dirty = true
+    return pid
+end
+
 function executor:_btree(root_id)
     return BTree.new(self.wal, root_id, function()
-        local pid = self.next_page_id
-        self.next_page_id = self.next_page_id + 1
-        return pid
+        return self:_allocate_page()
     end)
 end
 
@@ -43,8 +57,7 @@ function executor:reindex(target)
         if not norm_target or norm_target == "" or norm_target == idx_name or norm_target == idx_meta.table_name then
             local t_meta = self.catalog[idx_meta.table_name]
             if t_meta then
-                local root_id = self.next_page_id
-                self.next_page_id = self.next_page_id + 1
+                local root_id = self:_allocate_page()
                 idx_meta.root_page_id = root_id
 
                 local idx_tree = self:_btree(root_id)
@@ -118,6 +131,7 @@ end
 function executor:_load_catalog()
     local catalog_page = self.wal:read_page(1)
     if catalog_page then
+        self.freelist = {}
         local cat_tree = self:_btree(1)
         local items = cat_tree:scan_items()
         for _, item in ipairs(items) do
@@ -141,6 +155,12 @@ function executor:_load_catalog()
                     root_page_id = data[3]
                 }
                 if data[3] >= self.next_page_id then self.next_page_id = data[3] + 1 end
+            elseif type(key) == "string" and key:sub(1, 5) == "FREE:" then
+                local free_pid = tonumber(key:sub(6))
+                if free_pid then
+                    table.insert(self.freelist, free_pid)
+                    if free_pid >= self.next_page_id then self.next_page_id = free_pid + 1 end
+                end
             end
         end
     end
@@ -157,6 +177,9 @@ function executor:_save_catalog()
     end
     for idx_name, meta in pairs(self.indexes) do
         table.insert(items, { key = "IDX:" .. idx_name, row = { meta.table_name, meta.column_name, meta.root_page_id } })
+    end
+    for _, free_pid in ipairs(self.freelist) do
+        table.insert(items, { key = "FREE:" .. tostring(free_pid), row = { free_pid } })
     end
     local cat_page = page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF)
     cat_page = page_mgr.write_items(cat_page, items)
@@ -222,8 +245,7 @@ function executor:execute(ast)
             self:_save_catalog()
             return { message = "Table created: " .. ast.table }
         end
-        local root_id = self.next_page_id
-        self.next_page_id = self.next_page_id + 1
+        local root_id = self:_allocate_page()
 
         self:_btree(root_id)
         self.catalog[ast.table] = {
@@ -240,8 +262,7 @@ function executor:execute(ast)
         local meta = self.catalog[ast.table]
         if not meta then return nil, "Table not found: " .. ast.table end
 
-        local root_id = self.next_page_id
-        self.next_page_id = self.next_page_id + 1
+        local root_id = self:_allocate_page()
 
         local idx_tree = self:_btree(root_id)
         self.indexes[ast.index] = {
@@ -273,18 +294,41 @@ function executor:execute(ast)
 
     elseif cmd == "DROP_TABLE" then
         if not self.catalog[ast.table] then return nil, "Table not found: " .. ast.table end
-        self.catalog[ast.table] = nil
+        local meta = self.catalog[ast.table]
+
+        -- Reclaim all table B-Tree pages
+        local tbl_tree = self:_btree(meta.root_page_id)
+        local t_pages = tbl_tree:collect_all_pages()
+        for _, pid in ipairs(t_pages) do
+            if pid > 1 then table.insert(self.freelist, pid) end
+        end
+
+        -- Reclaim associated secondary index pages
         for idx_name, idx_meta in pairs(self.indexes) do
             if idx_meta.table_name:lower() == ast.table:lower() then
+                local idx_tree = self:_btree(idx_meta.root_page_id)
+                local i_pages = idx_tree:collect_all_pages()
+                for _, pid in ipairs(i_pages) do
+                    if pid > 1 then table.insert(self.freelist, pid) end
+                end
                 self.indexes[idx_name] = nil
             end
         end
+        self.catalog[ast.table] = nil
+        self._catalog_dirty = true
         self:_save_catalog()
         return { message = "Table dropped: " .. ast.table }
 
     elseif cmd == "DROP_INDEX" then
         if not self.indexes[ast.index] then return nil, "Index not found: " .. ast.index end
+        local idx_meta = self.indexes[ast.index]
+        local idx_tree = self:_btree(idx_meta.root_page_id)
+        local i_pages = idx_tree:collect_all_pages()
+        for _, pid in ipairs(i_pages) do
+            if pid > 1 then table.insert(self.freelist, pid) end
+        end
         self.indexes[ast.index] = nil
+        self._catalog_dirty = true
         self:_save_catalog()
         return { message = "Index dropped: " .. ast.index }
 

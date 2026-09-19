@@ -56,7 +56,14 @@ function scheduler.create_pool(size, config)
     self.sched = scheduler.new()
 
     for i = 1, self.size do
-        table.insert(self.connections, luadb.open(config))
+        local conn_cfg = {}
+        if config then
+            for k, v in pairs(config) do conn_cfg[k] = v end
+        end
+        if i > 1 then
+            conn_cfg.no_lock = true
+        end
+        table.insert(self.connections, luadb.open(conn_cfg))
     end
 
     return self

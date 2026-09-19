@@ -303,4 +303,28 @@ function BTree:_delete_from_node(page_id, key)
     return false
 end
 
+function BTree:collect_all_pages()
+    local pages = {}
+    local visited = {}
+    local function traverse(page_id)
+        if not page_id or page_id == 0 or visited[page_id] then return end
+        visited[page_id] = true
+        table.insert(pages, page_id)
+        local page_data = self.wal:read_page(page_id)
+        if not page_data then return end
+        local ptype = page_mgr.get_type(page_data)
+        if ptype == page_mgr.PAGE_TYPE_INTERIOR then
+            local keys, children, right_child = page_mgr.read_interior(page_data)
+            for _, child_id in ipairs(children) do
+                traverse(child_id)
+            end
+            if right_child and right_child > 0 then
+                traverse(right_child)
+            end
+        end
+    end
+    traverse(self.root_page_id)
+    return pages
+end
+
 return BTree

@@ -7,7 +7,10 @@ function parser.parse(sql, params)
     if #tokens == 0 then
         return nil, "Empty SQL statement"
     end
-    local ast = parser._parse_tokens(tokens, sql, params)
+    local ast, err = parser._parse_tokens(tokens, sql, params)
+    if not ast then
+        return nil, err or "SQL parse error"
+    end
     if ast and type(ast) == "table" then
         ast.raw_sql = sql
     end
@@ -26,11 +29,11 @@ function parser._parse_tokens(tokens, sql, params)
                 val = params[p_idx]
                 has_param = true
             end
-            p_idx = p_idx + 1
 
             if not has_param then
-                val = "luadb"
+                return nil, string.format("Bind error: missing parameter for placeholder at position %d", p_idx)
             end
+            p_idx = p_idx + 1
 
             if type(val) == "number" then
                 tokens[i] = { type = "NUMBER", value = val }
