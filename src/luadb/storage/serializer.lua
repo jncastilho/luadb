@@ -99,9 +99,6 @@ function serializer.pack_value(val)
         local jstr = json.stringify(val)
         return "\x05" .. serializer.pack_uint32(#jstr) .. jstr
     elseif type(val) == "string" then
-        if (val:sub(1,1) == "{" and val:sub(-1) == "}") or (val:sub(1,1) == "[" and val:sub(-1) == "]") then
-            return "\x05" .. serializer.pack_uint32(#val) .. val
-        end
         return "\x04" .. serializer.pack_uint32(#val) .. val
     else
         local str = tostring(val)

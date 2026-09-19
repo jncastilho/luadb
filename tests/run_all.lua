@@ -2,8 +2,10 @@ print("==================================================")
 print("  LuaDB Complete RDBMS Verification Suite (Verbose)  ")
 print("==================================================")
 -- Clean up any leftover temporary database files from previous runs
-for _, db_file in ipairs({ "temp_test.db", "employees.db", "json_test.db", "bugfix.db", "fk_test.db", "adv_test.db", "example_local.db", "reindex_test.db", "standalone_node.db", "cloud_database.db", "kamailio_cdr.db", "test_crud.db", "app.db", "test.db", "bugfix_test.db", "mydata.db", "luadb.db", "sql_spec_clean.db", "c_db_A.db", "c_db_B.db", "c_db_N1.db", "c_db_N2.db", "c_node_east.db", "c_node_west.db" }) do
+for _, db_file in ipairs({ "temp_test.db", "employees.db", "json_test.db", "bugfix.db", "fk_test.db", "adv_test.db", "example_local.db", "reindex_test.db", "standalone_node.db", "cloud_database.db", "kamailio_cdr.db", "test_crud.db", "app.db", "test.db", "bugfix_test.db", "mydata.db", "luadb.db", "sql_spec_clean.db", "c_db_A.db", "c_db_B.db", "c_db_N1.db", "c_db_N2.db", "c_node_east.db", "c_node_west.db", "bind_test.db", "lock_test.db", "freelist_test.db", "wal_crash.db", "qa3_temp.db", "qa3_stale.db", "qa_wal_auto.db", "qa_freelist_large.db" }) do
     os.remove(db_file)
+    os.remove(db_file .. ".wal")
+    os.remove(db_file .. ".lock")
 end
 dofile("tests/vfs_spec.lua")
 dofile("tests/storage_spec.lua")
@@ -18,6 +20,11 @@ dofile("tests/foreign_key_spec.lua")
 dofile("tests/advanced_features_spec.lua")
 dofile("tests/bugfixes_spec.lua")
 dofile("tests/crash_recovery_spec.lua")
+dofile("tests/parser_bind_spec.lua")
+dofile("tests/concurrency_locking_spec.lua")
+dofile("tests/freelist_spec.lua")
+dofile("tests/wal_crash_recovery_spec.lua")
+dofile("tests/qa_hardening_spec.lua")
 dofile("tests/darkroom_spec.lua")
 dofile("tests/benchmark_spec.lua")
 dofile("tests/examples_spec.lua")

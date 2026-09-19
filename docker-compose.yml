@@ -1,0 +1,56 @@
+# LuaDB Compatibility Test Infrastructure
+# Brings up the external database oracles used by tests/darkroom_spec.lua
+#
+# Usage:
+#   docker compose up -d          # start oracles
+#   make test-compat               # run full darkroom conformance suite
+#   docker compose down -v         # tear down + remove volumes
+#
+# Oracles included:
+#   - CockroachDB v23  → 127.0.0.1:26257  (cockroach CLI, insecure)
+#   - DynamoDB Local   → 127.0.0.1:8000   (AWS SDK / curl)
+
+services:
+
+  # ── CockroachDB ─────────────────────────────────────────────────────────────
+  # Single-node insecure mode matches darkroom_spec.lua:
+  #   cockroach sql --insecure --host=127.0.0.1:26257 ...
+  cockroachdb:
+    image: cockroachdb/cockroach:v23.2.3
+    container_name: luadb_cockroach
+    command: start-single-node --insecure --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080
+    ports:
+      - "127.0.0.1:26257:26257"   # SQL wire (PostgreSQL-compatible)
+      - "127.0.0.1:8080:8080"     # Admin UI
+    volumes:
+      - cockroach_data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=127.0.0.1:26257",
+             "-e", "SELECT 1 AS result;"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+    restart: on-failure
+
+  # ── DynamoDB Local ───────────────────────────────────────────────────────────
+  # Matches the darkroom_spec.lua DynamoDB probe:
+  #   curl http://localhost:8000  X-Amz-Target: DynamoDB_20120810.ListTables
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.4.0
+    container_name: luadb_dynamodb
+    command: -jar DynamoDBLocal.jar -sharedDb -inMemory
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL",
+             "curl -s -X POST http://localhost:8000 -H 'X-Amz-Target: DynamoDB_20120810.ListTables' -H 'Content-Type: application/x-amz-json-1.0' -d '{}' | grep -q TableNames"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    restart: on-failure
+
+volumes:
+  cockroach_data:
+    driver: local

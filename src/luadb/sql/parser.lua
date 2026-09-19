@@ -3,11 +3,20 @@ local lexer = require("luadb.sql.lexer")
 local parser = {}
 
 function parser.parse(sql, params)
-    local tokens = lexer.tokenize(sql)
+    local ok_lex, tokens = pcall(lexer.tokenize, sql)
+    if not ok_lex then
+        return nil, tostring(tokens):gsub("^.-:%d+:%s*", "")
+    end
     if #tokens == 0 then
         return nil, "Empty SQL statement"
     end
-    local ast = parser._parse_tokens(tokens, sql, params)
+    local ok, ast, err = pcall(parser._parse_tokens, tokens, sql, params)
+    if not ok then
+        return nil, tostring(ast):gsub("^.-:%d+:%s*", "")
+    end
+    if not ast then
+        return nil, err or "SQL parse error"
+    end
     if ast and type(ast) == "table" then
         ast.raw_sql = sql
     end
@@ -20,16 +29,23 @@ function parser._parse_tokens(tokens, sql, params)
     local p_idx = 1
     for i, t in ipairs(tokens) do
         if t.type == "PARAM" then
+            local dollar_idx = t.value and t.value:match("^%$(%d+)$")
+            local target_idx = dollar_idx and tonumber(dollar_idx) or p_idx
+            if not dollar_idx then
+                p_idx = p_idx + 1
+            else
+                p_idx = math.max(p_idx, target_idx + 1)
+            end
+
             local val = nil
             local has_param = false
-            if params and p_idx <= #params then
-                val = params[p_idx]
+            if params and (target_idx <= #params or params[target_idx] ~= nil) then
+                val = params[target_idx]
                 has_param = true
             end
-            p_idx = p_idx + 1
 
             if not has_param then
-                val = "luadb"
+                return nil, string.format("Bind error: missing parameter for placeholder at position %d", target_idx)
             end
 
             if type(val) == "number" then
@@ -85,6 +101,19 @@ function parser._parse_tokens(tokens, sql, params)
     end
 
     local function parse_expression()
+        if match_symbol("(") then
+            local expr = parse_expression()
+            if not match_symbol(")") then error("Expected ')' after parenthesized expression") end
+            if match_keyword("AND") then
+                local next_expr = parse_expression()
+                return { type = "AND", left = expr, right = next_expr }
+            elseif match_keyword("OR") then
+                local next_expr = parse_expression()
+                return { type = "OR", left = expr, right = next_expr }
+            end
+            return expr
+        end
+
         local left_ident = expect_identifier()
         local path_keys = {}
         local as_text = false
@@ -104,8 +133,42 @@ function parser._parse_tokens(tokens, sql, params)
         if match_keyword("IS") then
             local is_not = match_keyword("NOT")
             if match_keyword("NULL") then
-                return { left = left_node, op = is_not and "IS NOT NULL" or "IS NULL", right = nil }
+                local expr = { left = left_node, op = is_not and "IS NOT NULL" or "IS NULL", right = nil }
+                if match_keyword("AND") then
+                    local next_expr = parse_expression()
+                    return { type = "AND", left = expr, right = next_expr }
+                elseif match_keyword("OR") then
+                    local next_expr = parse_expression()
+                    return { type = "OR", left = expr, right = next_expr }
+                end
+                return expr
             end
+        end
+
+        if match_keyword("IN") then
+            if not match_symbol("(") then error("Expected '(' after IN") end
+            local in_vals = {}
+            repeat
+                local v = consume()
+                if v and v.type == "SYMBOL" and v.value == "-" then
+                    local next_v = consume()
+                    if next_v and next_v.type == "NUMBER" then v = { type = "NUMBER", value = -next_v.value } end
+                end
+                if v and (v.type == "NUMBER" or v.type == "STRING" or v.type == "IDENTIFIER" or v.type == "KEYWORD") then
+                    table.insert(in_vals, v.value)
+                end
+                if not match_symbol(",") then break end
+            until false
+            if not match_symbol(")") then error("Expected ')' after IN list") end
+            local expr = { left = left_node, op = "IN", right = in_vals }
+            if match_keyword("AND") then
+                local next_expr = parse_expression()
+                return { type = "AND", left = expr, right = next_expr }
+            elseif match_keyword("OR") then
+                local next_expr = parse_expression()
+                return { type = "OR", left = expr, right = next_expr }
+            end
+            return expr
         end
 
         local op_token = consume()
@@ -201,8 +264,10 @@ function parser._parse_tokens(tokens, sql, params)
 
             local columns = {}
             local foreign_keys = {}
+            local closed = false
             if match_symbol(")") then
                 columns = { { name = "id", type = "INTEGER", primary_key = true } }
+                closed = true
             else
                 repeat
                     if match_keyword("FOREIGN") then
@@ -260,12 +325,14 @@ function parser._parse_tokens(tokens, sql, params)
                     if match_symbol(",") then
                         -- continuation
                     elseif match_symbol(")") then
+                        closed = true
                         break
                     else
-                        break
+                        error("Expected ',' or ')' in column definitions")
                     end
                 until false
             end
+            if not closed then error("Expected ')' after column definitions") end
 
             match_symbol(";")
             return { command = "CREATE_TABLE", table = table_name, columns = columns, foreign_keys = foreign_keys }
@@ -376,7 +443,13 @@ function parser._parse_tokens(tokens, sql, params)
                         target_col = expect_identifier()
                     end
                     if not match_symbol(")") then error("Expected ')' after aggregate target") end
-                    table.insert(projections, { type = "AGGREGATE", func = agg_type, column = target_col })
+                    local alias = nil
+                    if match_keyword("AS") then
+                        alias = expect_identifier()
+                    elseif peek() and peek().type == "IDENTIFIER" and peek().value:upper() ~= "FROM" and peek().value:upper() ~= "WHERE" and peek().value:upper() ~= "GROUP" and peek().value:upper() ~= "ORDER" and peek().value ~= "," then
+                        alias = consume().value
+                    end
+                    table.insert(projections, { type = "AGGREGATE", func = agg_type, column = target_col, alias = alias })
                 else
                     local tok = consume()
                     if not tok then error("Unexpected EOF in SELECT projection") end
@@ -398,6 +471,11 @@ function parser._parse_tokens(tokens, sql, params)
                         end
                         match_symbol(")")
                         col_name = col_name .. "(" .. func_args .. ")"
+                    end
+
+                    local alias = nil
+                    if match_keyword("AS") then
+                        alias = expect_identifier()
                     end
 
                     local path_keys = {}
@@ -458,8 +536,7 @@ function parser._parse_tokens(tokens, sql, params)
 
         local where_clause = nil
         if match_keyword("WHERE") then
-            local ok, res = pcall(parse_expression)
-            if ok then where_clause = res end
+            where_clause = parse_expression()
         end
 
         local group_by = nil
@@ -539,8 +616,20 @@ function parser._parse_tokens(tokens, sql, params)
             local col = expect_identifier()
             local eq = consume()
             if not eq or (eq.type ~= "OPERATOR" and eq.value ~= "=") then error("Expected '=' in SET") end
-            local val = consume()
-            table.insert(set_assignments, { column = col, value = val.value })
+            local left_tok = consume()
+            local op_tok = peek()
+            if op_tok and op_tok.type == "SYMBOL" and (op_tok.value == "+" or op_tok.value == "-") then
+                local op = consume().value
+                local right_tok = consume()
+                table.insert(set_assignments, {
+                    column = col,
+                    expr = { left = left_tok.value, op = op, right = right_tok.value }
+                })
+            else
+                local val_to_store = left_tok.value
+                if left_tok.type == "KEYWORD" and left_tok.value:upper() == "NULL" then val_to_store = nil end
+                table.insert(set_assignments, { column = col, value = val_to_store })
+            end
             if not match_symbol(",") then break end
         until false
 

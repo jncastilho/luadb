@@ -10,22 +10,39 @@ function executor.new(wal)
     self.wal = wal
     self.catalog = {} -- table_name -> { root_page_id, columns, auto_inc, indexes }
     self.indexes = {} -- index_name -> { table_name, column_name, root_page_id }
+    self.freelist = {} -- list of freed page_ids available for reuse
     self.next_page_id = 2
+    self._catalog_dirty = false -- tracks whether auto_inc needs flushing
 
-    -- Auto-recover WAL transactions and reindex storage on process startup
+    -- Auto-recover WAL transactions on process startup.
+    -- NOTE: reindex() is NOT called here — index root_page_ids are already
+    -- persisted in the catalog and are loaded by _load_catalog() below.
+    -- Call REINDEX explicitly when you need to rebuild secondary indexes.
     if self.wal and self.wal.recover then
         pcall(function() self.wal:recover() end)
     end
     self:_load_catalog()
-    pcall(function() self:reindex() end)
     return self
+end
+
+function executor:_allocate_page()
+    if #self.freelist > 0 then
+        local pid = table.remove(self.freelist)
+        self._catalog_dirty = true
+        if self.wal and self.wal.write_page then
+            self.wal:write_page(pid, page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF))
+        end
+        return pid
+    end
+    local pid = self.next_page_id
+    self.next_page_id = self.next_page_id + 1
+    self._catalog_dirty = true
+    return pid
 end
 
 function executor:_btree(root_id)
     return BTree.new(self.wal, root_id, function()
-        local pid = self.next_page_id
-        self.next_page_id = self.next_page_id + 1
-        return pid
+        return self:_allocate_page()
     end)
 end
 
@@ -40,8 +57,7 @@ function executor:reindex(target)
         if not norm_target or norm_target == "" or norm_target == idx_name or norm_target == idx_meta.table_name then
             local t_meta = self.catalog[idx_meta.table_name]
             if t_meta then
-                local root_id = self.next_page_id
-                self.next_page_id = self.next_page_id + 1
+                local root_id = self:_allocate_page()
                 idx_meta.root_page_id = root_id
 
                 local idx_tree = self:_btree(root_id)
@@ -115,6 +131,7 @@ end
 function executor:_load_catalog()
     local catalog_page = self.wal:read_page(1)
     if catalog_page then
+        self.freelist = {}
         local cat_tree = self:_btree(1)
         local items = cat_tree:scan_items()
         for _, item in ipairs(items) do
@@ -138,6 +155,23 @@ function executor:_load_catalog()
                     root_page_id = data[3]
                 }
                 if data[3] >= self.next_page_id then self.next_page_id = data[3] + 1 end
+            elseif type(key) == "string" and key:sub(1, 5) == "FREE:" then
+                local rest = key:sub(6)
+                local start_pid, count = rest:match("^(%d+):(%d+)$")
+                if start_pid and count then
+                    start_pid = tonumber(start_pid)
+                    count = tonumber(count)
+                    for p = start_pid, start_pid + count - 1 do
+                        table.insert(self.freelist, p)
+                        if p >= self.next_page_id then self.next_page_id = p + 1 end
+                    end
+                else
+                    local free_pid = tonumber(rest)
+                    if free_pid then
+                        table.insert(self.freelist, free_pid)
+                        if free_pid >= self.next_page_id then self.next_page_id = free_pid + 1 end
+                    end
+                end
             end
         end
     end
@@ -155,6 +189,45 @@ function executor:_save_catalog()
     for idx_name, meta in pairs(self.indexes) do
         table.insert(items, { key = "IDX:" .. idx_name, row = { meta.table_name, meta.column_name, meta.root_page_id } })
     end
+
+    -- Deduplicate and sort freelist
+    local seen = {}
+    local unique_freelist = {}
+    for _, pid in ipairs(self.freelist) do
+        if not seen[pid] and pid > 1 then
+            seen[pid] = true
+            table.insert(unique_freelist, pid)
+        end
+    end
+    table.sort(unique_freelist)
+    self.freelist = unique_freelist
+
+    -- Pack contiguous ranges: FREE:start:count
+    local free_items = {}
+    local i = 1
+    while i <= #self.freelist do
+        local start_pid = self.freelist[i]
+        local count = 1
+        while i + count <= #self.freelist and self.freelist[i + count] == start_pid + count do
+            count = count + 1
+        end
+        if count == 1 then
+            table.insert(free_items, { key = "FREE:" .. tostring(start_pid), row = { start_pid, 1 } })
+        else
+            table.insert(free_items, { key = string.format("FREE:%d:%d", start_pid, count), row = { start_pid, count } })
+        end
+        i = i + count
+    end
+
+    -- Safely append freelist entries that fit within Page 1
+    for _, item in ipairs(free_items) do
+        table.insert(items, item)
+        if not page_mgr.can_fit(items) then
+            table.remove(items)
+            break
+        end
+    end
+
     local cat_page = page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF)
     cat_page = page_mgr.write_items(cat_page, items)
     self.wal:write_page(1, cat_page)
@@ -219,8 +292,7 @@ function executor:execute(ast)
             self:_save_catalog()
             return { message = "Table created: " .. ast.table }
         end
-        local root_id = self.next_page_id
-        self.next_page_id = self.next_page_id + 1
+        local root_id = self:_allocate_page()
 
         self:_btree(root_id)
         self.catalog[ast.table] = {
@@ -237,8 +309,7 @@ function executor:execute(ast)
         local meta = self.catalog[ast.table]
         if not meta then return nil, "Table not found: " .. ast.table end
 
-        local root_id = self.next_page_id
-        self.next_page_id = self.next_page_id + 1
+        local root_id = self:_allocate_page()
 
         local idx_tree = self:_btree(root_id)
         self.indexes[ast.index] = {
@@ -270,18 +341,41 @@ function executor:execute(ast)
 
     elseif cmd == "DROP_TABLE" then
         if not self.catalog[ast.table] then return nil, "Table not found: " .. ast.table end
-        self.catalog[ast.table] = nil
+        local meta = self.catalog[ast.table]
+
+        -- Reclaim all table B-Tree pages
+        local tbl_tree = self:_btree(meta.root_page_id)
+        local t_pages = tbl_tree:collect_all_pages()
+        for _, pid in ipairs(t_pages) do
+            if pid > 1 then table.insert(self.freelist, pid) end
+        end
+
+        -- Reclaim associated secondary index pages
         for idx_name, idx_meta in pairs(self.indexes) do
             if idx_meta.table_name:lower() == ast.table:lower() then
+                local idx_tree = self:_btree(idx_meta.root_page_id)
+                local i_pages = idx_tree:collect_all_pages()
+                for _, pid in ipairs(i_pages) do
+                    if pid > 1 then table.insert(self.freelist, pid) end
+                end
                 self.indexes[idx_name] = nil
             end
         end
+        self.catalog[ast.table] = nil
+        self._catalog_dirty = true
         self:_save_catalog()
         return { message = "Table dropped: " .. ast.table }
 
     elseif cmd == "DROP_INDEX" then
         if not self.indexes[ast.index] then return nil, "Index not found: " .. ast.index end
+        local idx_meta = self.indexes[ast.index]
+        local idx_tree = self:_btree(idx_meta.root_page_id)
+        local i_pages = idx_tree:collect_all_pages()
+        for _, pid in ipairs(i_pages) do
+            if pid > 1 then table.insert(self.freelist, pid) end
+        end
         self.indexes[ast.index] = nil
+        self._catalog_dirty = true
         self:_save_catalog()
         return { message = "Index dropped: " .. ast.index }
 
@@ -328,18 +422,45 @@ function executor:execute(ast)
                         end
                     end
                     if fk_val ~= nil then
-                        local parent_tree = self:_btree(parent_meta.root_page_id)
-                        local parent_rows = parent_tree:scan()
                         local found = false
-                        for _, p_row in ipairs(parent_rows) do
-                            for p_idx, p_col in ipairs(parent_meta.columns) do
-                                if p_col.name:lower() == fk.ref_column:lower() and p_row[p_idx] == fk_val then
-                                    found = true
+
+                        -- Fast path 1: ref_column is the parent PK → O(log n) B+Tree find()
+                        local ref_col_lower = fk.ref_column:lower()
+                        local parent_pk_col = nil
+                        for _, pc in ipairs(parent_meta.columns) do
+                            if pc.primary_key then parent_pk_col = pc.name:lower() break end
+                        end
+                        if parent_pk_col == ref_col_lower then
+                            local parent_tree = self:_btree(parent_meta.root_page_id)
+                            found = parent_tree:find(fk_val) ~= nil
+
+                        -- Fast path 2: ref_column has a secondary index → O(log n) index scan
+                        else
+                            for _, idx_meta in pairs(self.indexes) do
+                                if idx_meta.table_name:lower() == fk.ref_table:lower()
+                                   and idx_meta.column_name:lower() == ref_col_lower then
+                                    local idx_tree = self:_btree(idx_meta.root_page_id)
+                                    found = idx_tree:find(fk_val) ~= nil
                                     break
                                 end
                             end
-                            if found then break end
+
+                            -- Slow path: no index on ref_column → O(n) full scan (last resort)
+                            if not found then
+                                local parent_tree = self:_btree(parent_meta.root_page_id)
+                                local parent_rows = parent_tree:scan()
+                                for _, p_row in ipairs(parent_rows) do
+                                    for p_idx, p_col in ipairs(parent_meta.columns) do
+                                        if p_col.name:lower() == ref_col_lower and p_row[p_idx] == fk_val then
+                                            found = true
+                                            break
+                                        end
+                                    end
+                                    if found then break end
+                                end
+                            end
                         end
+
                         if not found then
                             return nil, string.format("FOREIGN KEY constraint failed: %s(%s) has no matching value '%s'", fk.ref_table, fk.ref_column, tostring(fk_val))
                         end
@@ -364,7 +485,15 @@ function executor:execute(ast)
             end
         end
 
-        self:_save_catalog()
+        -- Mark catalog dirty (auto_inc changed). Flush is deferred to COMMIT
+        -- or db:close() — not on every autocommit row — to avoid rewriting the
+        -- entire catalog B+Tree page for each INSERT.
+        if not self.wal.in_transaction then
+            self:_save_catalog()
+            self._catalog_dirty = false
+        else
+            self._catalog_dirty = true
+        end
         return { message = "Inserted 1 row", row_id = pk_val, affected_pks = { pk_val }, table_name = ast.table }
 
     elseif cmd == "SELECT" then
@@ -385,6 +514,20 @@ function executor:execute(ast)
                 record[key_name] = val
             end
             return { record }
+        end
+
+        local clean_table = ast.table and ast.table:match("([^%.]+)$") or ast.table
+        local meta = self.catalog[ast.table] or self.catalog[clean_table]
+        if meta and meta.transient_rows then
+            local t_rows = meta.transient_rows
+            if ast.cte then
+                if cte_backup then
+                    self.catalog[ast.cte.name] = cte_backup
+                else
+                    self.catalog[ast.cte.name] = nil
+                end
+            end
+            return t_rows
         end
 
         if ast.table and (ast.table:lower():find("pg_") or ast.table:lower():find("unnest")) then
@@ -759,8 +902,8 @@ function executor:execute(ast)
                         for k, v in pairs(a) do if k:lower() == col_name then a_val = v break end end
                         for k, v in pairs(b) do if k:lower() == col_name then b_val = v break end end
                         if a_val ~= b_val then
-                            if a_val == nil then return desc end
-                            if b_val == nil then return not desc end
+                            if a_val == nil then return not desc end
+                            if b_val == nil then return desc end
                             if type(a_val) ~= type(b_val) then a_val = tostring(a_val); b_val = tostring(b_val) end
                             if desc then return a_val > b_val else return a_val < b_val end
                         end
@@ -861,8 +1004,8 @@ function executor:execute(ast)
                     local a_val = cidx and ra[cidx] or nil
                     local b_val = cidx and rb[cidx] or nil
                     if a_val ~= b_val then
-                        if a_val == nil then return desc end
-                        if b_val == nil then return not desc end
+                        if a_val == nil then return not desc end
+                        if b_val == nil then return desc end
                         if type(a_val) ~= type(b_val) then
                             a_val = tostring(a_val)
                             b_val = tostring(b_val)
@@ -922,8 +1065,8 @@ function executor:execute(ast)
                         if k:lower() == col_name then b_val = v break end
                     end
                     if a_val ~= b_val then
-                        if a_val == nil then return desc end
-                        if b_val == nil then return not desc end
+                        if a_val == nil then return not desc end
+                        if b_val == nil then return desc end
                         if type(a_val) ~= type(b_val) then
                             a_val = tostring(a_val)
                             b_val = tostring(b_val)
@@ -976,7 +1119,17 @@ function executor:execute(ast)
                 for _, assign in ipairs(ast.assignments) do
                     for idx, col in ipairs(meta.columns) do
                         if col.name:lower() == assign.column:lower() then
-                            row[idx] = assign.value
+                            if assign.expr then
+                                local cur_v = row[idx] or 0
+                                local r_v = tonumber(assign.expr.right) or 0
+                                if assign.expr.op == "+" then
+                                    row[idx] = cur_v + r_v
+                                elseif assign.expr.op == "-" then
+                                    row[idx] = cur_v - r_v
+                                end
+                            else
+                                row[idx] = assign.value
+                            end
                         end
                     end
                 end
@@ -1073,8 +1226,15 @@ function executor:execute(ast)
         return { message = "Deleted " .. count .. " rows", affected_pks = affected_pks, table_name = ast.table }
 
     elseif cmd == "BEGIN" then self.wal:begin() return { message = "Transaction started" }
-    elseif cmd == "COMMIT" then self.wal:commit() return { message = "Transaction committed" }
-    elseif cmd == "ROLLBACK" then self.wal:rollback() return { message = "Transaction rolled back" }
+    elseif cmd == "COMMIT" then
+        -- Flush dirty catalog (auto_inc etc.) before committing WAL pages
+        if self._catalog_dirty then
+            self:_save_catalog()
+            self._catalog_dirty = false
+        end
+        self.wal:commit()
+        return { message = "Transaction committed" }
+    elseif cmd == "ROLLBACK" then self.wal:rollback() self._catalog_dirty = false return { message = "Transaction rolled back" }
     elseif cmd == "SESSION_SETTING" then
         local raw = ast.raw or ""
         local raw_upper = raw:upper()
@@ -1184,6 +1344,17 @@ function executor:_eval_where(where, row, columns)
             local ltarget = tostring(target):lower()
             local pattern = "^" .. ltarget:gsub("%%", ".*"):gsub("_", ".") .. "$"
             return string.match(lval, pattern) ~= nil
+        elseif op == "IN" then
+            if val == nil or type(where.right) ~= "table" then return false end
+            for _, item in ipairs(where.right) do
+                if val == item then return true end
+                if type(val) ~= type(item) then
+                    local num_v, num_item = tonumber(val), tonumber(item)
+                    if num_v and num_item and num_v == num_item then return true end
+                    if tostring(val) == tostring(item) then return true end
+                end
+            end
+            return false
         elseif op == "IS NULL" then
             return val == nil
         elseif op == "IS NOT NULL" then

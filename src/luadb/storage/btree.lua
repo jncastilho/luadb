@@ -87,8 +87,8 @@ function BTree:_insert_into_node(page_id, key, row)
             table.insert(items, { key = key, row = row })
         end
 
-        if page_mgr.can_fit(items) then
-            local updated_page = page_mgr.write_items(page_data, items)
+        local updated_page = page_mgr.write_items_if_fits(page_data, items)
+        if updated_page then
             self.wal:write_page(page_id, updated_page)
             return nil, nil
         else
@@ -172,9 +172,17 @@ function BTree:_find_in_node(page_id, key)
 
     if page_type == page_mgr.PAGE_TYPE_LEAF then
         local items = page_mgr.read_items(page_data)
-        for i = 1, #items do
-            if safe_cmp(items[i].key, key) == 0 then
-                return items[i].row
+        -- Binary search: leaf items are kept in sorted order by insert path
+        local lo, hi = 1, #items
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            local cmp = safe_cmp(items[mid].key, key)
+            if cmp == 0 then
+                return items[mid].row
+            elseif cmp < 0 then
+                lo = mid + 1
+            else
+                hi = mid - 1
             end
         end
     elseif page_type == page_mgr.PAGE_TYPE_INTERIOR then
@@ -260,17 +268,24 @@ function BTree:_delete_from_node(page_id, key)
 
     if page_type == page_mgr.PAGE_TYPE_LEAF then
         local items = page_mgr.read_items(page_data)
-        local new_items = {}
-        local deleted = false
-        for i = 1, #items do
-            if safe_cmp(items[i].key, key) == 0 then
-                deleted = true
+        -- Binary search to locate the item before removing it
+        local lo, hi = 1, #items
+        local found_idx = nil
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            local cmp = safe_cmp(items[mid].key, key)
+            if cmp == 0 then
+                found_idx = mid
+                break
+            elseif cmp < 0 then
+                lo = mid + 1
             else
-                table.insert(new_items, items[i])
+                hi = mid - 1
             end
         end
-        if deleted then
-            local updated_page = page_mgr.write_items(page_data, new_items)
+        if found_idx then
+            table.remove(items, found_idx)
+            local updated_page = page_mgr.write_items(page_data, items)
             self.wal:write_page(page_id, updated_page)
             return true
         end
@@ -286,6 +301,30 @@ function BTree:_delete_from_node(page_id, key)
         return self:_delete_from_node(target_child, key)
     end
     return false
+end
+
+function BTree:collect_all_pages()
+    local pages = {}
+    local visited = {}
+    local function traverse(page_id)
+        if not page_id or page_id == 0 or visited[page_id] then return end
+        visited[page_id] = true
+        table.insert(pages, page_id)
+        local page_data = self.wal:read_page(page_id)
+        if not page_data then return end
+        local ptype = page_mgr.get_type(page_data)
+        if ptype == page_mgr.PAGE_TYPE_INTERIOR then
+            local keys, children, right_child = page_mgr.read_interior(page_data)
+            for _, child_id in ipairs(children) do
+                traverse(child_id)
+            end
+            if right_child and right_child > 0 then
+                traverse(right_child)
+            end
+        end
+    end
+    traverse(self.root_page_id)
+    return pages
 end
 
 return BTree

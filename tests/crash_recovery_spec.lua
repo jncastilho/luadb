@@ -31,9 +31,9 @@ db2:begin()
 db2:exec("UPDATE accounts SET balance = 0.0 WHERE id = 1;")
 db2:exec("INSERT INTO accounts VALUES (3, 'Malicious Uncommitted', 99999.0);")
 
--- Simulate sudden crash/kill WITHOUT calling db2:commit() or db2:close()
--- We call WAL recover directly to simulate process restart recovery
-db2.wal:recover()
+-- Simulate sudden crash/kill WITHOUT calling db2:commit()
+-- Close file handle to simulate process exit and lock release
+if db2.file then db2.file:close() end
 
 -- 3. Verify Database Storage Remains Clean & Uncorrupted
 print("\n[Crash Recovery Test 3] Verify Post-Crash Storage Integrity")

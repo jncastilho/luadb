@@ -14,12 +14,12 @@ function luadb.open(config)
     local storage_path = config.storage_path or "luadb.db"
 
     local vfs = vfs_factory.create(driver_type, config.s3 or config)
-    local file_obj, err = vfs:open(storage_path, "r+b")
+    local file_obj, err = vfs:open(storage_path, "r+b", config)
     if not file_obj then
         error("LuaDB failed to open storage: " .. tostring(err))
     end
 
-    local wal = WAL.new(file_obj)
+    local wal = WAL.new(file_obj, vfs, storage_path)
     local exec = Executor.new(wal)
 
     local db = {
@@ -125,11 +125,15 @@ function luadb.open(config)
         return collectgarbage("count")
     end
 
+    function db:checkpoint()
+        return self.wal:checkpoint()
+    end
+
     function db:close()
         if self.replicator then
             self.replicator:persist_state()
         end
-        self.wal:commit()
+        self.wal:close()
         if self.file then
             self.file:close()
             self.file = nil

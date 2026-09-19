@@ -208,7 +208,7 @@ luadb/
 │   │   └── wal.lua            # Write-Ahead Log, BEGIN/COMMIT/ROLLBACK
 │   └── vfs/                   # Local, Memory, and S3 SigV4 VFS drivers
 ├── tests/                     # 16-suite master verification framework
-│   ├── darkroom_spec.lua      # 50-case comparative test vs external sqlite3 (50/50 MATCH)
+│   ├── darkroom_spec.lua      # 62-case comparative test vs external sqlite3 (62/62 MATCH)
 │   ├── conflict_spec.lua      # HLC clock catch-up, LWW tie-break & state persistence
 │   ├── crash_recovery_spec.lua # Deterministic WAL crash recovery fuzzing
 │   ├── benchmark_spec.lua     # TPS, query latency, and memory footprint metrics
