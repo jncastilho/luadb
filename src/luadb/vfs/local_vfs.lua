@@ -9,16 +9,28 @@ if has_ffi then
         ffi.cdef[[
             int fileno(void *stream);
             int fsync(int fd);
+            int getpid(void);
         ]]
     end)
 end
 
 local function _get_pid()
+    if has_ffi then
+        local ok, pid = pcall(function() return tonumber(ffi.C.getpid()) end)
+        if ok and pid then return pid end
+    end
     local f = io.open("/proc/self/stat", "r")
     if f then
         local content = f:read("*a")
         f:close()
         local pid = tonumber(content:match("^(%d+)"))
+        if pid then return pid end
+    end
+    local handle = io.popen("sh -c 'echo $PPID' 2>/dev/null")
+    if handle then
+        local out = handle:read("*a")
+        handle:close()
+        local pid = tonumber(out and out:match("(%d+)"))
         if pid then return pid end
     end
     return 1000
@@ -31,7 +43,9 @@ local function _is_pid_alive(pid)
         f:close()
         return true
     end
-    return false
+    -- POSIX fallback for macOS / BSD / systems without /proc
+    local ok = os.execute("kill -0 " .. pid .. " 2>/dev/null")
+    return ok == 0 or ok == true
 end
 
 function LocalVFS.new(config)

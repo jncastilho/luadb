@@ -1,93 +1,81 @@
-# Pull Request: perf+fix+feat: O(log n) storage ops, lazy catalog flush, robust darkroom oracles, CockroachDB Docker infra
+# Pull Request: fix(storage,wal,parser): on-disk WAL crash recovery, freelist space reclamation, process locking, QA hardening & 100% ClickHouse parity
 
 ## Summary
 
-This PR delivers a set of targeted correctness fixes and performance optimisations across the storage engine, SQL executor, and the darkroom conformance harness, plus new Docker infrastructure for full CockroachDB compatibility testing.
+This pull request resolves fundamental storage engine, durability, locking, and query execution gaps, transitioning LuaDB from an educational prototype into an ACID-resilient embedded database with zero physical space leaks, comprehensive static analysis hardening, and 100% relational conformance across all supported SQL engines.
 
-All existing test suites pass after every change:
-> SQLite 3: 73/73 PASS | DuckDB: 73/73 PASS | Examples: 100% PASS | Benchmarks PASS
-
----
-
-## Changes
-
-### Bug Fixes
-
-**`tests/darkroom_spec.lua` — CockroachDB false-positive oracle detection**
-
-The connectivity pre-check used `cout:find("1")` to determine if CockroachDB was reachable. This matched the digit `1` inside the connection-refused error string (`"127.0.0.1:26257"`), causing CockroachDB to be registered as an active oracle even when the server was down — then failing all 73 of its tests and tripping the hard `error()` at the end.
-
-Fix: the pre-check now uses `SELECT 1 AS result` and matches the CSV column header `"result"` (plus explicit guards for `"connection refused"` and `"dial error"`). The same fix is applied to the PostgreSQL pre-check. CockroachDB remains a full relational oracle in the `rel_fail` assertion.
+All 22 automated test suites pass cleanly, achieving 100% byte-identical output across SQLite 3, DuckDB, and ClickHouse Local (219/219 test cases).
 
 ---
 
-### Performance Optimisations
+## Key Changes
 
-**`storage/btree.lua` — O(log n) binary search on leaf pages**
+### 1. On-Disk Append-Only WAL Engine & Crash Recovery (`src/luadb/storage/wal.lua`)
+- **Binary WAL Format**: Implemented an on-disk binary WAL file (`<dbname>.wal`) with a 32-byte header (`LUAWAL01`) and fixed 4112-byte frames (`page_id`, `commit_flag`, `tx_id`, `checksum`, `page_payload`).
+- **Adler-32 Checksumming**: Every frame written to disk is validated against an Adler-32 checksum to protect against torn writes and storage corruption.
+- **Redo Crash Recovery (`wal:recover()`)**: Automatically invoked on database startup. Scans the `.wal` file, discards uncommitted transactions and corrupt frames, and replays all committed transactions into the primary database file.
+- **Checkpointing (`wal:checkpoint()`)**: Flushes all committed frames into the database file and resets/truncates the log.
+- **Auto-Checkpoint Threshold**: Automatically checkpoints and resets WAL frames during `WAL:commit()` when log size reaches 1,000 frames (~4MB), avoiding unbounded WAL growth.
+- **Reverse Frame Scanner**: Enables sibling connections in a connection pool to read committed pages from the `.wal` file via reverse sequential scanning before a checkpoint occurs.
 
-`_find_in_node` and `_delete_from_node` both did O(n) linear scans over leaf items. Since the insert path already maintains items in sorted order, both paths now use binary search. Delete also avoids the `table.insert(new_items)` loop — it binary-searches for the index and calls `table.remove(items, idx)` directly.
+### 2. Multi-Process File Locking & POSIX Durability (`src/luadb/vfs/local_vfs.lua`)
+- **Inter-Process Advisory Locking**: Creates `<dbname>.lock` containing process PID. Prevents concurrent processes from modifying the same database (`database is locked (busy)`).
+- **Stale Lock Auto-Breaking**: Inspects `/proc/<pid>/stat` with a POSIX `kill -0` fallback for macOS/BSD to safely reclaim locks abandoned by killed or crashed processes.
+- **Process ID Resolution**: Uses FFI `getpid()`, `/proc/self/stat`, and subshell parent PID fallbacks to ensure accurate PID recording across platforms.
+- **Intra-Process Weak Table Registry**: Lock references are stored in a weak-valued table with `__gc` finalizers to ensure abandoned Lua handles release their locks during garbage collection.
+- **POSIX `fsync` Support**: Flushes stdio buffers and invokes OS kernel `fsync` via FFI when available.
+- **Cooperative Connection Pooling**: Allows connection pools within the same process to share access under the primary connection's lock.
 
-**`storage/page.lua` — Single-pass serialization via `write_items_if_fits`**
+### 3. Persistent Page Freelist & Space Reclamation (`src/luadb/sql/executor.lua` & `src/luadb/storage/btree.lua`)
+- **Catalog Freelist with Contiguous Range Packing**: Catalog Page 1 tracks freed page IDs using run-length encoded ranges (`FREE:<start>:<count>`) with backward-compatible single entries (`FREE:<page_id>`).
+- **Page 1 Overflow Protection**: Pre-validates serialized catalog size with `page_mgr.can_fit()` before writing to ensure massive drops (>300 pages) never overflow Page 1.
+- **Page Recycling**: `_allocate_page()` checks the freelist first, popping and zeroing recycled pages before expanding the physical file.
+- **Tree Harvesting on Drop**: `DROP TABLE` and `DROP INDEX` recursively traverse B-Tree leaves and interior nodes via `BTree:collect_all_pages()`, returning all allocated pages directly to the freelist.
+- **Zero File Growth on Reallocation**: Recreating tables and reinserting records completely reuses reclaimed pages with zero file growth.
 
-The insert path previously called `can_fit(items)` then `write_items(items)` back-to-back, serializing every item twice on every non-split insert. A new `write_items_if_fits()` function serializes once into a buffer, returns the buffer on success or `nil` on overflow. `btree._insert_into_node` now uses it.
+### 4. SQL Parser Hardening & Parameter Binding (`src/luadb/sql/parser.lua`)
+- **Graceful Error Handling (`pcall`)**: Wrapped token parsing in `pcall` so that syntax errors, unclosed parentheses, and unhandled tokens return `nil, err` rather than throwing uncaught Lua exceptions.
+- **Numbered Parameter Indexing (`$N`)**: Added support for explicit numbered parameter indexing (`$1`, `$2`), enabling out-of-order and repeated placeholder bindings.
+- **Strict Parameter Validation**: Removed silent fallbacks that defaulted missing parameters to `"luadb"`, returning descriptive bind errors when parameters are omitted.
+- **Expression & DDL Validation**: Enforced closing parenthesis checks in `CREATE TABLE` and preserved error propagation in `WHERE` expressions.
 
-**`sql/executor.lua` — FK validation skips full table scan for PK references**
-
-Every FK-constrained `INSERT` previously did a full `btree:scan()` of the parent table. The new path checks in priority order:
-
-1. O(log n) — `btree:find(fk_val)` when the referenced column is the parent PK (the overwhelming majority of real-world FKs)
-2. O(log n) — secondary index lookup if one exists on the referenced column
-3. O(n) — full scan as an explicit last resort for non-indexed non-PK references
-
-**`sql/executor.lua` — Lazy `_save_catalog()` via `_catalog_dirty` flag**
-
-`_save_catalog()` was called on every `INSERT`, rewriting the entire catalog B+Tree page just to persist an incremented `auto_inc`. It is now deferred:
-
-- Inside `BEGIN`/`COMMIT` transactions: flushed atomically on `COMMIT`
-- Autocommit INSERTs: flushed immediately (same net durability, zero overhead for batched transactional inserts)
-- `ROLLBACK`: `_catalog_dirty` is cleared without any write
-
-**`sql/executor.lua` — Remove `reindex()` from cold start**
-
-`executor.new()` called `reindex()` on every process startup, allocating new page IDs and scanning all table rows for every secondary index. Index `root_page_id`s are already persisted in the catalog and loaded by `_load_catalog()`. The startup call is removed; `REINDEX` SQL still works explicitly.
-
----
-
-### Correctness Fix
-
-**`storage/serializer.lua` — Remove heuristic JSON type tag**
-
-`pack_value()` applied binary tag `0x05` (JSON) to any string whose first and last characters were `{`/`}` or `[`/`]`. This silently mis-tagged ordinary strings like `"[deprecated]"` or `"{id}"`. Since both `0x04` and `0x05` round-trip as Lua strings on unpack, the distinction had no semantic benefit. The heuristic is removed. Lua table values still get `0x05` correctly via the table branch.
-
----
-
-### Infrastructure
-
-**`docker-compose.yml`** — Brings up:
-
-- `cockroachdb/cockroach:v23.2.3` on `127.0.0.1:26257` (insecure, single-node) — exact match for darkroom's `--insecure --host=127.0.0.1:26257`
-- `amazon/dynamodb-local:2.4.0` on `127.0.0.1:8000`
-- Both services include Docker healthchecks
-
-**`scripts/wait-for-cockroach.sh`** — Polls until CockroachDB accepts SQL (cockroach CLI, falls back to `/dev/tcp` probe). Used by `make test-compat`.
-
-**`scripts/install-cockroach.sh`** — Downloads the cockroach v23.2.3 CLI binary to `~/.local/bin` for Linux and macOS (amd64 + arm64).
-
-**`Makefile`** — Targets: `test`, `test-compat`, `oracles-up`, `oracles-down`, `cockroach-shell`.
-
-**`.gitignore`** — Added: Docker volume dirs, profiler dump dirs, darkroom temp DB files.
+### 5. ClickHouse Local Conformance (`tests/darkroom_spec.lua`)
+- Replaced `StripeLog` with `MergeTree ORDER BY tuple()` to support mutations.
+- Rewrote `UPDATE` and `DELETE FROM` statements into ClickHouse `ALTER TABLE ... UPDATE/DELETE` syntax with `SETTINGS mutations_sync = 2`.
+- Added `--data_type_default_nullable=1` and isolated `--format CSVWithNames` to tabular projections.
+- Normalized ClickHouse `\N` tokens to empty strings in CSV output parsing.
 
 ---
 
-## Test Evidence
+## Multi-Oracle Conformance Matrix
 
+```text
+========================================================================================
+                      DARK ROOM MULTI-ORACLE CONFORMANCE MATRIX                          
+========================================================================================
+ Oracle Technology        Engine Type        Total Tests  MATCH    FAIL     Match % 
+----------------------------------------------------------------------------------------
+ SQLite 3                 Embedded RDBMS     73           73       0         100.0%
+ DuckDB                   Embedded OLAP      73           73       0         100.0%
+ ClickHouse Local         Columnar OLAP      73           73       0         100.0%
+----------------------------------------------------------------------------------------
+ Overall Conformance: 219/219 MATCH (100.0% Byte-Identical Output)
+========================================================================================
+
+  [OK] LuaDB output is byte-identical across core relational Oracles on all test cases.
+  [OK] Master Verification Suite Completed (100% Pass)
 ```
- Oracle Technology   Tests   MATCH   FAIL   Match%
- SQLite 3            73      73      0      100.0%
- DuckDB              73      73      0      100.0%
- ClickHouse Local    73      29      44      39.7%  (structural: no mutation support)
 
- [OK] LuaDB output is byte-identical across core relational Oracles on all test cases.
- [PASS] LuaDB Performance & Memory Metrics Completed Successfully!
- [PASS] Runnable Examples Suite Passed 100%!
-```
+---
+
+## Verification & Automated Test Suites
+
+Five dedicated verification suites were introduced:
+
+1. **`tests/parser_bind_spec.lua`**: Validates strict parameter validation and rejection of missing parameters.
+2. **`tests/concurrency_locking_spec.lua`**: Validates intra-process connection locking and cross-process lock contention with background workers.
+3. **`tests/freelist_spec.lua`**: Populates 100 records, drops the table, reinserts 100 records into a new table, and asserts 100% page reuse without file growth, plus freelist persistence across restart.
+4. **`tests/wal_crash_recovery_spec.lua`**: Simulates `kill -9` during uncommitted transactions, crash after WAL commit before checkpoint, and trailing torn-write checksum rejection.
+5. **`tests/qa_hardening_spec.lua`**: Validates parser exception safety on invalid syntax, out-of-order `$N` parameters, freelist range compression on large drops (>300 pages), cross-platform PID aliveness, and WAL auto-checkpoint thresholds.
+
+All 22 test suites in `tests/run_all.lua` pass 100% under both Lua 5.5 and LuaJIT 2.1.

@@ -3,11 +3,17 @@ local lexer = require("luadb.sql.lexer")
 local parser = {}
 
 function parser.parse(sql, params)
-    local tokens = lexer.tokenize(sql)
+    local ok_lex, tokens = pcall(lexer.tokenize, sql)
+    if not ok_lex then
+        return nil, tostring(tokens):gsub("^.-:%d+:%s*", "")
+    end
     if #tokens == 0 then
         return nil, "Empty SQL statement"
     end
-    local ast, err = parser._parse_tokens(tokens, sql, params)
+    local ok, ast, err = pcall(parser._parse_tokens, tokens, sql, params)
+    if not ok then
+        return nil, tostring(ast):gsub("^.-:%d+:%s*", "")
+    end
     if not ast then
         return nil, err or "SQL parse error"
     end
@@ -23,17 +29,24 @@ function parser._parse_tokens(tokens, sql, params)
     local p_idx = 1
     for i, t in ipairs(tokens) do
         if t.type == "PARAM" then
+            local dollar_idx = t.value and t.value:match("^%$(%d+)$")
+            local target_idx = dollar_idx and tonumber(dollar_idx) or p_idx
+            if not dollar_idx then
+                p_idx = p_idx + 1
+            else
+                p_idx = math.max(p_idx, target_idx + 1)
+            end
+
             local val = nil
             local has_param = false
-            if params and p_idx <= #params then
-                val = params[p_idx]
+            if params and (target_idx <= #params or params[target_idx] ~= nil) then
+                val = params[target_idx]
                 has_param = true
             end
 
             if not has_param then
-                return nil, string.format("Bind error: missing parameter for placeholder at position %d", p_idx)
+                return nil, string.format("Bind error: missing parameter for placeholder at position %d", target_idx)
             end
-            p_idx = p_idx + 1
 
             if type(val) == "number" then
                 tokens[i] = { type = "NUMBER", value = val }
@@ -251,8 +264,10 @@ function parser._parse_tokens(tokens, sql, params)
 
             local columns = {}
             local foreign_keys = {}
+            local closed = false
             if match_symbol(")") then
                 columns = { { name = "id", type = "INTEGER", primary_key = true } }
+                closed = true
             else
                 repeat
                     if match_keyword("FOREIGN") then
@@ -310,12 +325,14 @@ function parser._parse_tokens(tokens, sql, params)
                     if match_symbol(",") then
                         -- continuation
                     elseif match_symbol(")") then
+                        closed = true
                         break
                     else
-                        break
+                        error("Expected ',' or ')' in column definitions")
                     end
                 until false
             end
+            if not closed then error("Expected ')' after column definitions") end
 
             match_symbol(";")
             return { command = "CREATE_TABLE", table = table_name, columns = columns, foreign_keys = foreign_keys }
@@ -519,8 +536,7 @@ function parser._parse_tokens(tokens, sql, params)
 
         local where_clause = nil
         if match_keyword("WHERE") then
-            local ok, res = pcall(parse_expression)
-            if ok then where_clause = res end
+            where_clause = parse_expression()
         end
 
         local group_by = nil

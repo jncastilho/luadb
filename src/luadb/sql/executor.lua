@@ -156,10 +156,21 @@ function executor:_load_catalog()
                 }
                 if data[3] >= self.next_page_id then self.next_page_id = data[3] + 1 end
             elseif type(key) == "string" and key:sub(1, 5) == "FREE:" then
-                local free_pid = tonumber(key:sub(6))
-                if free_pid then
-                    table.insert(self.freelist, free_pid)
-                    if free_pid >= self.next_page_id then self.next_page_id = free_pid + 1 end
+                local rest = key:sub(6)
+                local start_pid, count = rest:match("^(%d+):(%d+)$")
+                if start_pid and count then
+                    start_pid = tonumber(start_pid)
+                    count = tonumber(count)
+                    for p = start_pid, start_pid + count - 1 do
+                        table.insert(self.freelist, p)
+                        if p >= self.next_page_id then self.next_page_id = p + 1 end
+                    end
+                else
+                    local free_pid = tonumber(rest)
+                    if free_pid then
+                        table.insert(self.freelist, free_pid)
+                        if free_pid >= self.next_page_id then self.next_page_id = free_pid + 1 end
+                    end
                 end
             end
         end
@@ -178,9 +189,45 @@ function executor:_save_catalog()
     for idx_name, meta in pairs(self.indexes) do
         table.insert(items, { key = "IDX:" .. idx_name, row = { meta.table_name, meta.column_name, meta.root_page_id } })
     end
-    for _, free_pid in ipairs(self.freelist) do
-        table.insert(items, { key = "FREE:" .. tostring(free_pid), row = { free_pid } })
+
+    -- Deduplicate and sort freelist
+    local seen = {}
+    local unique_freelist = {}
+    for _, pid in ipairs(self.freelist) do
+        if not seen[pid] and pid > 1 then
+            seen[pid] = true
+            table.insert(unique_freelist, pid)
+        end
     end
+    table.sort(unique_freelist)
+    self.freelist = unique_freelist
+
+    -- Pack contiguous ranges: FREE:start:count
+    local free_items = {}
+    local i = 1
+    while i <= #self.freelist do
+        local start_pid = self.freelist[i]
+        local count = 1
+        while i + count <= #self.freelist and self.freelist[i + count] == start_pid + count do
+            count = count + 1
+        end
+        if count == 1 then
+            table.insert(free_items, { key = "FREE:" .. tostring(start_pid), row = { start_pid, 1 } })
+        else
+            table.insert(free_items, { key = string.format("FREE:%d:%d", start_pid, count), row = { start_pid, count } })
+        end
+        i = i + count
+    end
+
+    -- Safely append freelist entries that fit within Page 1
+    for _, item in ipairs(free_items) do
+        table.insert(items, item)
+        if not page_mgr.can_fit(items) then
+            table.remove(items)
+            break
+        end
+    end
+
     local cat_page = page_mgr.new_page(page_mgr.PAGE_TYPE_LEAF)
     cat_page = page_mgr.write_items(cat_page, items)
     self.wal:write_page(1, cat_page)

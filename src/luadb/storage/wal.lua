@@ -8,6 +8,7 @@ WAL.HEADER_SIZE = 32
 WAL.FRAME_HEADER_SIZE = 16
 WAL.PAGE_SIZE = 4096
 WAL.FRAME_SIZE = 4112 -- 16 bytes header + 4096 bytes data
+WAL.AUTO_CHECKPOINT_FRAMES = 1000
 
 local function adler32(data)
     local a = 1
@@ -30,6 +31,7 @@ function WAL.new(vfs_file, vfs, storage_path)
     self.wal_index = {}     -- committed page mutations awaiting checkpoint { [page_id] = page_data }
     self.in_transaction = false
     self.tx_id = 0
+    self.auto_checkpoint_frames = WAL.AUTO_CHECKPOINT_FRAMES
 
     if self.vfs and self.storage_path then
         local wal_name = self.storage_path .. ".wal"
@@ -180,6 +182,15 @@ function WAL:commit()
 
     self.pending_pages = {}
     self.in_transaction = false
+
+    -- Auto-checkpoint when WAL exceeds threshold (default 1,000 frames)
+    if self.wal_file and self.auto_checkpoint_frames and self.auto_checkpoint_frames > 0 then
+        local threshold_size = WAL.HEADER_SIZE + (self.auto_checkpoint_frames * WAL.FRAME_SIZE)
+        if self.wal_file:size() >= threshold_size then
+            self:checkpoint()
+        end
+    end
+
     return true
 end
 
