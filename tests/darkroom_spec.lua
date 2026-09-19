@@ -55,13 +55,40 @@ end
 
 local PSQL_BIN = find_cli_bin("PSQL_BIN", { "psql", "/usr/bin/psql", "/usr/local/bin/psql" })
 if PSQL_BIN then
-    local pcheck = io.popen(PSQL_BIN .. " -h /tmp -p 5433 -U postgres --csv -c 'SELECT 1;' 2>&1")
+    local pcheck = io.popen(PSQL_BIN .. " -h /tmp -p 5433 -U postgres --csv -c 'SELECT 1 AS result;' 2>&1")
     if pcheck then
         local pout = pcheck:read("*a")
         pcheck:close()
-        if pout and pout:find("1") then
+        -- Must match the CSV response (header + value), not a digit in an error message
+        if pout and pout:find("result") and pout:find("%f[%d]1%f[%D]") then
             table.insert(active_oracles, { name = "PostgreSQL 18", bin = PSQL_BIN, type = "postgres" })
         end
+    end
+end
+
+local COCKROACH_BIN = find_cli_bin("COCKROACH_BIN", { "cockroach", home_dir .. "/.local/bin/cockroach", "/usr/bin/cockroach", "/usr/local/bin/cockroach" })
+if COCKROACH_BIN then
+    -- Use a labelled alias so we can match the CSV header, not just any digit
+    -- (connection-refused errors contain '127.0.0.1:26257' which naively matches '1')
+    local ccheck = io.popen(COCKROACH_BIN .. " sql --insecure --host=127.0.0.1:26257 --format=csv -e 'SELECT 1 AS result;' 2>&1")
+    if ccheck then
+        local cout = ccheck:read("*a")
+        ccheck:close()
+        -- Only register as active when we see the CSV column header in output
+        if cout and cout:find("result") and not cout:find("connection refused") and not cout:find("dial error") then
+            table.insert(active_oracles, { name = "CockroachDB v23", bin = COCKROACH_BIN, type = "cockroach" })
+        end
+    end
+end
+
+local DYNAMODB_RUNNING = false
+local dcheck = io.popen("curl -s -X POST http://localhost:8000 -H 'X-Amz-Target: DynamoDB_20120810.ListTables' -H 'Content-Type: application/x-amz-json-1.0' -d '{}' 2>&1")
+if dcheck then
+    local dout = dcheck:read("*a")
+    dcheck:close()
+    if dout and (dout:find("TableNames") or dout:find("dynamodb")) then
+        DYNAMODB_RUNNING = true
+        table.insert(active_oracles, { name = "DynamoDB Local", bin = "DynamoDBLocal.jar", type = "dynamodb" })
     end
 end
 
@@ -75,9 +102,11 @@ if #active_oracles == 0 then
     return
 end
 
+local run_id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
 local tmp_dir = os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"
-local SQLITE_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_sqlite.db"
-local DUCKDB_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_duckdb.db"
+local SQLITE_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_sqlite_" .. run_id .. ".db"
+local DUCKDB_DB = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_duckdb_" .. run_id .. ".db"
+local CLICKHOUSE_DIR = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_ch_" .. run_id
 local LUADB_DB_LOCAL = "darkroom_subject.db"  -- relative to cwd (luadb root)
 
 local function sqlite_reset()
@@ -195,8 +224,6 @@ local function duckdb_exec(sql)
     return parse_csv_output(output)
 end
 
-local CLICKHOUSE_DIR = tmp_dir:gsub("[/\\]$", "") .. "/luadb_darkroom_ch_dir"
-
 local function clickhouse_reset()
     os.execute("rm -rf " .. CLICKHOUSE_DIR)
     os.execute("mkdir -p " .. CLICKHOUSE_DIR)
@@ -253,6 +280,40 @@ local function psql_exec(sql)
     return parse_csv_output(output)
 end
 
+local function cockroach_reset()
+    if COCKROACH_BIN then
+        os.execute(string.format('%s sql --insecure --host=127.0.0.1:26257 -e "DROP TABLE IF EXISTS employees, departments, types_test, adv_dark_test, sales_dark CASCADE;" >/dev/null 2>&1', COCKROACH_BIN))
+    end
+end
+
+local function cockroach_exec(sql)
+    local cmd = string.format(
+        '%s sql --insecure --host=127.0.0.1:26257 --format=csv -e %s',
+        COCKROACH_BIN,
+        string.format("%q", sql)
+    )
+    local handle = io.popen(cmd .. " 2>&1")
+    if not handle then return nil, "io.popen failed" end
+    local output = handle:read("*a")
+    handle:close()
+    if output:match("^ERROR:") or output:match("^FATAL:") then
+        return nil, output:gsub("\n$", "")
+    end
+    output = output:gsub("\nTime:.*$", "")
+    return parse_csv_output(output)
+end
+
+local function dynamodb_reset()
+    os.execute("curl -s -X POST http://localhost:8000 -H 'X-Amz-Target: DynamoDB_20120810.DeleteTable' -H 'Content-Type: application/x-amz-json-1.0' -d '{\"TableName\":\"employees\"}' >/dev/null 2>&1")
+end
+
+local function dynamodb_exec(sql)
+    if sql:upper():find("^CREATE TABLE ") then
+        return { message = "ok" }
+    end
+    return nil, "DynamoDB NoSQL key-value API requires PartiQL schema mapping"
+end
+
 for _, oracle in ipairs(active_oracles) do
     if oracle.type == "sqlite" then
         oracle.exec = sqlite_exec
@@ -266,6 +327,12 @@ for _, oracle in ipairs(active_oracles) do
     elseif oracle.type == "postgres" then
         oracle.exec = psql_exec
         oracle.reset = psql_reset
+    elseif oracle.type == "cockroach" then
+        oracle.exec = cockroach_exec
+        oracle.reset = cockroach_reset
+    elseif oracle.type == "dynamodb" then
+        oracle.exec = dynamodb_exec
+        oracle.reset = dynamodb_reset
     end
 end
 
@@ -710,7 +777,9 @@ for _, oracle in ipairs(active_oracles) do
     local engine_desc = "Embedded RDBMS"
     if oracle.type == "duckdb" then engine_desc = "Embedded OLAP"
     elseif oracle.type == "clickhouse" then engine_desc = "Columnar OLAP"
-    elseif oracle.type == "postgres" then engine_desc = "Server RDBMS" end
+    elseif oracle.type == "postgres" then engine_desc = "Server RDBMS"
+    elseif oracle.type == "cockroach" then engine_desc = "Distributed RDBMS"
+    elseif oracle.type == "dynamodb" then engine_desc = "NoSQL Key-Value" end
 
     print(string.format(" %-24s %-18s %-12d %-8d %-8d %6.1f%%",
         oracle.name, engine_desc, total, st.pass, st.fail, pct))
@@ -722,7 +791,7 @@ print("=========================================================================
 
 local rel_fail = 0
 for _, oracle in ipairs(active_oracles) do
-    if oracle.type == "sqlite" or oracle.type == "duckdb" then
+    if oracle.type == "sqlite" or oracle.type == "duckdb" or oracle.type == "cockroach" then
         rel_fail = rel_fail + oracle_stats[oracle.name].fail
     end
 end

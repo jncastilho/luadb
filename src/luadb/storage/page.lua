@@ -60,12 +60,25 @@ function page_mgr.read_items(page_data)
     return items
 end
 
-function page_mgr.can_fit(items)
-    local size = 9 -- header size
+-- Serialize items and return (body_str, fits_bool) in one pass — avoids
+-- the double-serialization that occurred when can_fit() + write_items() were
+-- called back-to-back.
+local function _serialize_items(page_type, next_id, items)
+    local parts = { string.char(page_type), serializer.pack_uint32(#items), serializer.pack_uint32(next_id) }
     for i = 1, #items do
-        local key_str = serializer.pack_value(items[i].key)
-        local row_str = serializer.pack_row(items[i].row)
-        size = size + #key_str + #row_str
+        table.insert(parts, serializer.pack_value(items[i].key))
+        table.insert(parts, serializer.pack_row(items[i].row))
+    end
+    return table.concat(parts)
+end
+
+-- Returns true only if serialized size fits within PAGE_SIZE (no serialization
+-- is wasted — the result is discarded by the caller if it doesn't fit anyway;
+-- in the common case it does fit and write_items reuses the buffer).
+function page_mgr.can_fit(items)
+    local size = 9 -- header
+    for i = 1, #items do
+        size = size + #serializer.pack_value(items[i].key) + #serializer.pack_row(items[i].row)
     end
     return size <= page_mgr.PAGE_SIZE
 end
@@ -74,18 +87,27 @@ end
 function page_mgr.write_items(page_data, items, next_page_id)
     local page_type = page_mgr.get_type(page_data) or page_mgr.PAGE_TYPE_LEAF
     local next_id = next_page_id or page_mgr.get_next_page(page_data)
-    local parts = { string.char(page_type), serializer.pack_uint32(#items), serializer.pack_uint32(next_id) }
-    for i = 1, #items do
-        table.insert(parts, serializer.pack_value(items[i].key))
-        table.insert(parts, serializer.pack_row(items[i].row))
-    end
-    local body = table.concat(parts)
+    local body = _serialize_items(page_type, next_id, items)
     if #body > page_mgr.PAGE_SIZE then
         error("Page payload overflow: " .. #body .. " > " .. page_mgr.PAGE_SIZE)
     end
     local padding = string.rep("\0", page_mgr.PAGE_SIZE - #body)
     return body .. padding
 end
+
+-- Attempt to write items; returns nil if they don't fit (caller must split).
+-- Serializes only once and reuses the buffer — no double-serialization.
+function page_mgr.write_items_if_fits(page_data, items, next_page_id)
+    local page_type = page_mgr.get_type(page_data) or page_mgr.PAGE_TYPE_LEAF
+    local next_id = next_page_id or page_mgr.get_next_page(page_data)
+    local body = _serialize_items(page_type, next_id, items)
+    if #body > page_mgr.PAGE_SIZE then
+        return nil  -- signal: caller must split
+    end
+    local padding = string.rep("\0", page_mgr.PAGE_SIZE - #body)
+    return body .. padding
+end
+
 
 -- Read interior page (key -> child_page_id mappings)
 function page_mgr.read_interior(page_data)

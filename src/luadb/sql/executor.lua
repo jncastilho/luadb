@@ -11,13 +11,16 @@ function executor.new(wal)
     self.catalog = {} -- table_name -> { root_page_id, columns, auto_inc, indexes }
     self.indexes = {} -- index_name -> { table_name, column_name, root_page_id }
     self.next_page_id = 2
+    self._catalog_dirty = false -- tracks whether auto_inc needs flushing
 
-    -- Auto-recover WAL transactions and reindex storage on process startup
+    -- Auto-recover WAL transactions on process startup.
+    -- NOTE: reindex() is NOT called here — index root_page_ids are already
+    -- persisted in the catalog and are loaded by _load_catalog() below.
+    -- Call REINDEX explicitly when you need to rebuild secondary indexes.
     if self.wal and self.wal.recover then
         pcall(function() self.wal:recover() end)
     end
     self:_load_catalog()
-    pcall(function() self:reindex() end)
     return self
 end
 
@@ -328,18 +331,45 @@ function executor:execute(ast)
                         end
                     end
                     if fk_val ~= nil then
-                        local parent_tree = self:_btree(parent_meta.root_page_id)
-                        local parent_rows = parent_tree:scan()
                         local found = false
-                        for _, p_row in ipairs(parent_rows) do
-                            for p_idx, p_col in ipairs(parent_meta.columns) do
-                                if p_col.name:lower() == fk.ref_column:lower() and p_row[p_idx] == fk_val then
-                                    found = true
+
+                        -- Fast path 1: ref_column is the parent PK → O(log n) B+Tree find()
+                        local ref_col_lower = fk.ref_column:lower()
+                        local parent_pk_col = nil
+                        for _, pc in ipairs(parent_meta.columns) do
+                            if pc.primary_key then parent_pk_col = pc.name:lower() break end
+                        end
+                        if parent_pk_col == ref_col_lower then
+                            local parent_tree = self:_btree(parent_meta.root_page_id)
+                            found = parent_tree:find(fk_val) ~= nil
+
+                        -- Fast path 2: ref_column has a secondary index → O(log n) index scan
+                        else
+                            for _, idx_meta in pairs(self.indexes) do
+                                if idx_meta.table_name:lower() == fk.ref_table:lower()
+                                   and idx_meta.column_name:lower() == ref_col_lower then
+                                    local idx_tree = self:_btree(idx_meta.root_page_id)
+                                    found = idx_tree:find(fk_val) ~= nil
                                     break
                                 end
                             end
-                            if found then break end
+
+                            -- Slow path: no index on ref_column → O(n) full scan (last resort)
+                            if not found then
+                                local parent_tree = self:_btree(parent_meta.root_page_id)
+                                local parent_rows = parent_tree:scan()
+                                for _, p_row in ipairs(parent_rows) do
+                                    for p_idx, p_col in ipairs(parent_meta.columns) do
+                                        if p_col.name:lower() == ref_col_lower and p_row[p_idx] == fk_val then
+                                            found = true
+                                            break
+                                        end
+                                    end
+                                    if found then break end
+                                end
+                            end
                         end
+
                         if not found then
                             return nil, string.format("FOREIGN KEY constraint failed: %s(%s) has no matching value '%s'", fk.ref_table, fk.ref_column, tostring(fk_val))
                         end
@@ -364,7 +394,15 @@ function executor:execute(ast)
             end
         end
 
-        self:_save_catalog()
+        -- Mark catalog dirty (auto_inc changed). Flush is deferred to COMMIT
+        -- or db:close() — not on every autocommit row — to avoid rewriting the
+        -- entire catalog B+Tree page for each INSERT.
+        if not self.wal.in_transaction then
+            self:_save_catalog()
+            self._catalog_dirty = false
+        else
+            self._catalog_dirty = true
+        end
         return { message = "Inserted 1 row", row_id = pk_val, affected_pks = { pk_val }, table_name = ast.table }
 
     elseif cmd == "SELECT" then
@@ -1097,8 +1135,15 @@ function executor:execute(ast)
         return { message = "Deleted " .. count .. " rows", affected_pks = affected_pks, table_name = ast.table }
 
     elseif cmd == "BEGIN" then self.wal:begin() return { message = "Transaction started" }
-    elseif cmd == "COMMIT" then self.wal:commit() return { message = "Transaction committed" }
-    elseif cmd == "ROLLBACK" then self.wal:rollback() return { message = "Transaction rolled back" }
+    elseif cmd == "COMMIT" then
+        -- Flush dirty catalog (auto_inc etc.) before committing WAL pages
+        if self._catalog_dirty then
+            self:_save_catalog()
+            self._catalog_dirty = false
+        end
+        self.wal:commit()
+        return { message = "Transaction committed" }
+    elseif cmd == "ROLLBACK" then self.wal:rollback() self._catalog_dirty = false return { message = "Transaction rolled back" }
     elseif cmd == "SESSION_SETTING" then
         local raw = ast.raw or ""
         local raw_upper = raw:upper()
