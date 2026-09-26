@@ -12,7 +12,7 @@ All 22 automated test suites pass cleanly, achieving 100% byte-identical output 
 
 ## Key Changes
 
-### 1. On-Disk Append-Only WAL Engine & Crash Recovery (`src/luadb/storage/wal.lua`)
+### 1. On-Disk Append-Only WAL Engine & Crash Recovery (`src/europadb/storage/wal.lua`)
 - **Binary WAL Format**: Implemented an on-disk binary WAL file (`<dbname>.wal`) with a 32-byte header (`LUAWAL01`) and fixed 4112-byte frames (`page_id`, `commit_flag`, `tx_id`, `checksum`, `page_payload`).
 - **Adler-32 Checksumming**: Every frame written to disk is validated against an Adler-32 checksum to protect against torn writes and storage corruption.
 - **Redo Crash Recovery (`wal:recover()`)**: Automatically invoked on database startup. Scans the `.wal` file, discards uncommitted transactions and corrupt frames, and replays all committed transactions into the primary database file.
@@ -20,7 +20,7 @@ All 22 automated test suites pass cleanly, achieving 100% byte-identical output 
 - **Auto-Checkpoint Threshold**: Automatically checkpoints and resets WAL frames during `WAL:commit()` when log size reaches 1,000 frames (~4MB), avoiding unbounded WAL growth.
 - **$O(1)$ In-Memory WAL Frame Index (`wal_frame_index`)**: Replaced linear reverse disk scanning with an $O(1)$ in-memory frame index tracking exact byte offsets for committed pages, eliminating latency spikes on cache misses.
 
-### 2. Multi-Process File Locking & POSIX Durability (`src/luadb/vfs/local_vfs.lua`)
+### 2. Multi-Process File Locking & POSIX Durability (`src/europadb/vfs/local_vfs.lua`)
 - **Kernel-Level `flock` & `busy_timeout` Exponential Backoff**: Enhanced advisory locking with POSIX kernel `flock` (via LuaJIT FFI when available) and a configurable `busy_timeout` retry loop with exponential backoff. Concurrent connections and workers gracefully wait for lock releases rather than abruptly crashing with busy errors.
 - **Inter-Process Advisory Locking**: Creates `<dbname>.lock` containing process PID. Prevents concurrent processes from modifying the same database (`database is locked (busy)`).
 - **Stale Lock Auto-Breaking**: Inspects `/proc/<pid>/stat` with a POSIX `kill -0` fallback for macOS/BSD to safely reclaim locks abandoned by killed or crashed processes.
@@ -29,14 +29,14 @@ All 22 automated test suites pass cleanly, achieving 100% byte-identical output 
 - **POSIX `fsync` Support**: Flushes stdio buffers and invokes OS kernel `fsync` via FFI when available.
 - **Cooperative Connection Pooling**: Allows connection pools within the same process to share access under the primary connection's lock.
 
-### 3. Persistent Page Freelist & Space Reclamation (`src/luadb/sql/executor.lua` & `src/luadb/storage/btree.lua`)
+### 3. Persistent Page Freelist & Space Reclamation (`src/europadb/sql/executor.lua` & `src/europadb/storage/btree.lua`)
 - **Catalog Freelist with Contiguous Range Packing**: Catalog Page 1 tracks freed page IDs using run-length encoded ranges (`FREE:<start>:<count>`) with backward-compatible single entries (`FREE:<page_id>`).
 - **Page 1 Overflow Protection**: Pre-validates serialized catalog size with `page_mgr.can_fit()` before writing to ensure massive drops (>300 pages) never overflow Page 1.
 - **Page Recycling**: `_allocate_page()` checks the freelist first, popping and zeroing recycled pages before expanding the physical file.
 - **Tree Harvesting on Drop**: `DROP TABLE` and `DROP INDEX` recursively traverse B-Tree leaves and interior nodes via `BTree:collect_all_pages()`, returning all allocated pages directly to the freelist.
 - **Zero File Growth on Reallocation**: Recreating tables and reinserting records completely reuses reclaimed pages with zero file growth.
 
-### 4. SQL Parser Hardening & Parameter Binding (`src/luadb/sql/parser.lua`)
+### 4. SQL Parser Hardening & Parameter Binding (`src/europadb/sql/parser.lua`)
 - **Graceful Error Handling (`pcall`)**: Wrapped token parsing in `pcall` so that syntax errors, unclosed parentheses, and unhandled tokens return `nil, err` rather than throwing uncaught Lua exceptions.
 - **Numbered Parameter Indexing (`$N`)**: Added support for explicit numbered parameter indexing (`$1`, `$2`), enabling out-of-order and repeated placeholder bindings.
 - **Strict Parameter Validation**: Removed silent fallbacks that defaulted missing parameters to `"luadb"`, returning descriptive bind errors when parameters are omitted.
