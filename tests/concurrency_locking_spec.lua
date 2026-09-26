@@ -64,6 +64,22 @@ assert(#r3 == 1, "Expected query to succeed post-external release")
 print("  ✓ [OK] Reacquired lock cleanly after external process exited")
 db3:close()
 
+-- 6. Test busy_timeout waiting for lock release
+print("\n[Locking Test 6] busy_timeout Graceful Waiting & Acquisition")
+-- Start external background process that holds lock for 0.4s
+local bg_cmd2 = string.format("lua -e 'package.path=\"src/?.lua;src/?/init.lua;\"..package.path; local db=require(\"luadb\").open({driver=\"local\", storage_path=\"%s\"}); os.execute(\"sleep 0.4\"); db:close()' &", db_file)
+os.execute(bg_cmd2)
+-- Sleep 0.1s to ensure background process has acquired lock
+os.execute("sleep 0.1")
+
+-- Open with busy_timeout = 1500ms (should wait and succeed)
+local db4 = luadb.open({ driver = "local", storage_path = db_file, busy_timeout = 1500 })
+assert(db4 ~= nil, "Expected db4 to open successfully with busy_timeout")
+local r4 = db4:exec("SELECT count(*) AS cnt FROM test_lock;")
+assert(#r4 == 1 and r4[1].cnt == 1, "Expected data integrity with busy_timeout")
+print("  ✓ [OK] busy_timeout gracefully waited and acquired lock once released")
+db4:close()
+
 os.remove(db_file)
 os.remove(db_file .. ".wal")
 os.remove(db_file .. ".lock")

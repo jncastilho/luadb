@@ -33,6 +33,9 @@ function WAL.new(vfs_file, vfs, storage_path)
     self.tx_id = 0
     self.auto_checkpoint_frames = WAL.AUTO_CHECKPOINT_FRAMES
 
+    self.wal_frame_index = {} -- [page_id] = wal_file_byte_offset
+    self.wal_indexed_size = WAL.HEADER_SIZE
+
     if self.vfs and self.storage_path then
         local wal_name = self.storage_path .. ".wal"
         local ok, wf = pcall(function()
@@ -65,33 +68,64 @@ function WAL:write_page(page_id, page_data)
     end
 end
 
+function WAL:sync_wal_index()
+    if not self.wal_file then return end
+    local current_size = self.wal_file:size()
+    if current_size < self.wal_indexed_size then
+        -- Checkpoint occurred and truncated/reset the WAL file
+        self.wal_frame_index = {}
+        self.wal_indexed_size = WAL.HEADER_SIZE
+    end
+    if current_size >= self.wal_indexed_size + WAL.FRAME_SIZE then
+        local offset = self.wal_indexed_size
+        while offset + WAL.FRAME_SIZE <= current_size do
+            local frame_data = self.wal_file:read(offset, WAL.FRAME_SIZE)
+            if not frame_data or #frame_data < WAL.FRAME_SIZE then break end
+
+            local page_id = serializer.unpack_uint32(frame_data, 1)
+            local commit_flag = serializer.unpack_uint32(frame_data, 5)
+            local tx_id = serializer.unpack_uint32(frame_data, 9)
+            local stored_cksum = serializer.unpack_uint32(frame_data, 13)
+            local page_payload = frame_data:sub(17, 16 + WAL.PAGE_SIZE)
+
+            local payload = serializer.pack_uint32(page_id) ..
+                            serializer.pack_uint32(commit_flag) ..
+                            serializer.pack_uint32(tx_id) ..
+                            page_payload
+            if adler32(payload) == stored_cksum then
+                self.wal_frame_index[page_id] = offset
+            else
+                break
+            end
+            offset = offset + WAL.FRAME_SIZE
+        end
+        self.wal_indexed_size = offset
+    end
+end
+
 function WAL:read_wal_frame(target_page_id)
     if not self.wal_file then return nil end
-    local wal_size = self.wal_file:size()
-    if wal_size < WAL.HEADER_SIZE + WAL.FRAME_SIZE then return nil end
+    self:sync_wal_index()
+    local offset = self.wal_frame_index[target_page_id]
+    if not offset then return nil end
 
-    -- Scan backwards from end of file for fastest hit on latest page
-    local offset = wal_size - WAL.FRAME_SIZE
-    while offset >= WAL.HEADER_SIZE do
-        local frame_data = self.wal_file:read(offset, WAL.FRAME_SIZE)
-        if frame_data and #frame_data == WAL.FRAME_SIZE then
-            local page_id = serializer.unpack_uint32(frame_data, 1)
-            if page_id == target_page_id then
-                local commit_flag = serializer.unpack_uint32(frame_data, 5)
-                local tx_id = serializer.unpack_uint32(frame_data, 9)
-                local stored_cksum = serializer.unpack_uint32(frame_data, 13)
-                local page_payload = frame_data:sub(17, 16 + WAL.PAGE_SIZE)
+    local frame_data = self.wal_file:read(offset, WAL.FRAME_SIZE)
+    if frame_data and #frame_data == WAL.FRAME_SIZE then
+        local page_id = serializer.unpack_uint32(frame_data, 1)
+        if page_id == target_page_id then
+            local commit_flag = serializer.unpack_uint32(frame_data, 5)
+            local tx_id = serializer.unpack_uint32(frame_data, 9)
+            local stored_cksum = serializer.unpack_uint32(frame_data, 13)
+            local page_payload = frame_data:sub(17, 16 + WAL.PAGE_SIZE)
 
-                local payload = serializer.pack_uint32(page_id) ..
-                                serializer.pack_uint32(commit_flag) ..
-                                serializer.pack_uint32(tx_id) ..
-                                page_payload
-                if adler32(payload) == stored_cksum then
-                    return page_payload
-                end
+            local payload = serializer.pack_uint32(page_id) ..
+                            serializer.pack_uint32(commit_flag) ..
+                            serializer.pack_uint32(tx_id) ..
+                            page_payload
+            if adler32(payload) == stored_cksum then
+                return page_payload
             end
         end
-        offset = offset - WAL.FRAME_SIZE
     end
     return nil
 end
@@ -162,7 +196,9 @@ function WAL:commit()
             local frame = frame_hdr .. page_data
             local wal_offset = self.wal_file:size()
             self.wal_file:write(wal_offset, frame)
+            self.wal_frame_index[page_id] = wal_offset
         end
+        self.wal_indexed_size = self.wal_file:size()
         self.wal_file:sync()
     end
 
@@ -208,6 +244,8 @@ function WAL:checkpoint()
     end
     self.file:sync()
     self.wal_index = {}
+    self.wal_frame_index = {}
+    self.wal_indexed_size = WAL.HEADER_SIZE
 
     -- Reset on-disk WAL file
     if self.wal_file then
