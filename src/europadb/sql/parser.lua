@@ -1,4 +1,4 @@
-local lexer = require("luadb.sql.lexer")
+local lexer = require("europadb.sql.lexer")
 
 local parser = {}
 

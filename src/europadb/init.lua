@@ -1,22 +1,24 @@
-local vfs_factory = require("luadb.vfs")
-local WAL = require("luadb.storage.wal")
-local parser = require("luadb.sql.parser")
-local Executor = require("luadb.sql.executor")
-local scheduler = require("luadb.async.scheduler")
+local vfs_factory = require("europadb.vfs")
+local WAL = require("europadb.storage.wal")
+local parser = require("europadb.sql.parser")
+local Executor = require("europadb.sql.executor")
+local scheduler = require("europadb.async.scheduler")
 
-local luadb = {
-    _VERSION = "1.1.0"
+local europadb = {
+    _VERSION = "2.0.0-europa",
+    _HERITAGE = "LuaDB"
 }
+local luadb = europadb
 
-function luadb.open(config)
+function europadb.open(config)
     config = config or {}
     local driver_type = config.driver or "local"
-    local storage_path = config.storage_path or "luadb.db"
+    local storage_path = config.storage_path or "europadb.db"
 
     local vfs = vfs_factory.create(driver_type, config.s3 or config)
     local file_obj, err = vfs:open(storage_path, "r+b", config)
     if not file_obj then
-        error("LuaDB failed to open storage: " .. tostring(err))
+        error("EuropaDB failed to open storage: " .. tostring(err))
     end
 
     local wal = WAL.new(file_obj, vfs, storage_path)
@@ -29,7 +31,7 @@ function luadb.open(config)
         executor = exec
     }
 
-    local replicator_mod = require("luadb.cluster.replicator")
+    local replicator_mod = require("europadb.cluster.replicator")
     local rep = replicator_mod.new(db, {
         nodes = config.nodes,
         nodes_env = config.nodes_env,
@@ -145,8 +147,26 @@ function luadb.open(config)
 end
 
 -- Parallel Connection Pool Factory
-function luadb.pool(size, config)
+function europadb.pool(size, config)
     return scheduler.create_pool(size, config)
 end
 
-return luadb
+-- Backwards compatibility searcher: intercepts require("luadb...") and require("europa...")
+local searchers = package.loaders or package.searchers
+if searchers and not _G._EUROPADB_LOADER_REGISTERED then
+    _G._EUROPADB_LOADER_REGISTERED = true
+    table.insert(searchers, 1, function(modname)
+        if modname == "luadb" or modname == "europa" then
+            return function() return require("europadb") end
+        elseif modname:sub(1, 6) == "luadb." then
+            local redirected = "europadb." .. modname:sub(7)
+            return function() return require(redirected) end
+        elseif modname:sub(1, 7) == "europa." then
+            local redirected = "europadb." .. modname:sub(8)
+            return function() return require(redirected) end
+        end
+        return nil
+    end)
+end
+
+return europadb

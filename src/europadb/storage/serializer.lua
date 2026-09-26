@@ -95,7 +95,7 @@ function serializer.pack_value(val)
     elseif type(val) == "number" then
         return "\x03" .. serializer.pack_number(val)
     elseif type(val) == "table" then
-        local json = require("luadb.sql.json")
+        local json = require("europadb.sql.json")
         local jstr = json.stringify(val)
         return "\x05" .. serializer.pack_uint32(#jstr) .. jstr
     elseif type(val) == "string" then

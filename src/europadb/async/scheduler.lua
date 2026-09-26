@@ -49,7 +49,7 @@ local pool = {}
 pool.__index = pool
 
 function scheduler.create_pool(size, config)
-    local luadb = require("luadb")
+    local europadb = require("europadb")
     local self = setmetatable({}, pool)
     self.size = size or 4
     self.connections = {}
@@ -63,7 +63,7 @@ function scheduler.create_pool(size, config)
         if i > 1 then
             conn_cfg.no_lock = true
         end
-        table.insert(self.connections, luadb.open(conn_cfg))
+        table.insert(self.connections, europadb.open(conn_cfg))
     end
 
     return self

@@ -169,7 +169,7 @@ function pg_server._process_client_stream(db, client)
 
         -- Handle Inter-Node Cluster Replication frame ('R' or 'A')
         if #pkt >= 5 and (pkt:sub(1, 1) == "R" or pkt:sub(1, 1) == "A") and client.state == "STARTUP" then
-            local proto = require("luadb.cluster.proto")
+            local proto = require("europadb.cluster.proto")
             local msg, rest = proto.parse_msg(pkt)
             if msg then
                 client.buf = rest

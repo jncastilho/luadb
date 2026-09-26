@@ -10,30 +10,54 @@ if has_ffi then
             int fileno(void *stream);
             int fsync(int fd);
             int getpid(void);
+            int flock(int fd, int operation);
+            int usleep(unsigned int usec);
         ]]
     end)
 end
 
+local _cached_pid = nil
 local function _get_pid()
+    if _cached_pid then return _cached_pid end
     if has_ffi then
         local ok, pid = pcall(function() return tonumber(ffi.C.getpid()) end)
-        if ok and pid then return pid end
+        if ok and pid then
+            _cached_pid = pid
+            return pid
+        end
     end
     local f = io.open("/proc/self/stat", "r")
     if f then
         local content = f:read("*a")
         f:close()
         local pid = tonumber(content:match("^(%d+)"))
-        if pid then return pid end
+        if pid then
+            _cached_pid = pid
+            return pid
+        end
     end
     local handle = io.popen("sh -c 'echo $PPID' 2>/dev/null")
     if handle then
         local out = handle:read("*a")
         handle:close()
         local pid = tonumber(out and out:match("(%d+)"))
-        if pid then return pid end
+        if pid then
+            _cached_pid = pid
+            return pid
+        end
     end
+    _cached_pid = 1000
     return 1000
+end
+
+local function _sleep_ms(ms)
+    if has_ffi and ffi.C and ffi.C.usleep then
+        pcall(function() ffi.C.usleep(math.floor(ms * 1000)) end)
+    else
+        local t0 = os.clock()
+        local target = ms / 1000
+        while os.clock() - t0 < target do end
+    end
 end
 
 local function _is_pid_alive(pid)
@@ -63,36 +87,75 @@ function LocalVFS:open(filename, mode, options)
     -- File Locking for primary database files
     local lock_path = full_path .. ".lock"
     local needs_lock = (not is_wal) and (not no_lock) and (mode ~= "rb")
+    local lock_handle = nil
 
     if needs_lock then
-        -- Collect any abandoned handles before checking in-process collision
-        collectgarbage("collect")
-        -- 1. Check in-process lock collision
-        if LocalVFS._active_locks[full_path] then
-            return nil, "database is locked (busy: concurrent connection in same process)"
-        end
+        local busy_timeout = (options and tonumber(options.busy_timeout)) or 0
+        local start_clock = os.clock()
+        local last_busy_err = nil
 
-        -- 2. Check inter-process lockfile
-        local lf = io.open(lock_path, "r")
-        if lf then
-            local raw = lf:read("*a")
-            lf:close()
-            local owner_pid = tonumber(raw:match("^(%d+)"))
-            local my_pid = _get_pid()
-            if owner_pid and owner_pid ~= my_pid and _is_pid_alive(owner_pid) then
-                return nil, string.format("database is locked (busy: held by process %d)", owner_pid)
+        while true do
+            collectgarbage("collect")
+            -- 1. Check in-process lock collision
+            if LocalVFS._active_locks[full_path] then
+                last_busy_err = "database is locked (busy: concurrent connection in same process)"
             else
-                -- Stale lock from crashed process or same process re-opening
-                os.remove(lock_path)
+                -- 2. Check inter-process lockfile
+                local lf = io.open(lock_path, "r")
+                local owner_pid = nil
+                if lf then
+                    local raw = lf:read("*a")
+                    lf:close()
+                    owner_pid = tonumber(raw and raw:match("^(%d+)"))
+                end
+
+                local my_pid = _get_pid()
+                if owner_pid and owner_pid ~= my_pid and _is_pid_alive(owner_pid) then
+                    last_busy_err = string.format("database is locked (busy: held by process %d)", owner_pid)
+                else
+                    if owner_pid and owner_pid ~= my_pid then
+                        os.remove(lock_path)
+                    end
+
+                    -- 3. Acquire lockfile with flock
+                    local out_lf = io.open(lock_path, "w+b")
+                    if out_lf then
+                        local flock_ok = true
+                        if has_ffi and ffi.C and ffi.C.flock and ffi.C.fileno then
+                            local ok, fd = pcall(function() return ffi.C.fileno(out_lf) end)
+                            if ok and fd and fd >= 0 then
+                                local ret = ffi.C.flock(fd, 2 + 4) -- LOCK_EX | LOCK_NB
+                                if ret ~= 0 then
+                                    flock_ok = false
+                                end
+                            end
+                        end
+
+                        if flock_ok then
+                            out_lf:write(tostring(my_pid) .. "\n")
+                            out_lf:flush()
+                            lock_handle = out_lf
+                            last_busy_err = nil
+                            break
+                        else
+                            out_lf:close()
+                            last_busy_err = "database is locked (busy: flock contention)"
+                        end
+                    else
+                        last_busy_err = "database is locked (busy: cannot open lockfile)"
+                    end
+                end
             end
+
+            local elapsed_ms = (os.clock() - start_clock) * 1000
+            if elapsed_ms >= busy_timeout then
+                break
+            end
+            _sleep_ms(math.min(25, math.max(1, busy_timeout - elapsed_ms)))
         end
 
-        -- 3. Acquire lockfile
-        local out_lf, lerr = io.open(lock_path, "w")
-        if out_lf then
-            out_lf:write(tostring(_get_pid()) .. "\n")
-            out_lf:flush()
-            out_lf:close()
+        if last_busy_err then
+            return nil, last_busy_err
         end
     end
 
@@ -102,6 +165,10 @@ function LocalVFS:open(filename, mode, options)
         handle, err = io.open(full_path, "w+b")
     end
     if not handle then
+        if lock_handle then
+            lock_handle:close()
+            lock_handle = nil
+        end
         if needs_lock then
             os.remove(lock_path)
         end
@@ -112,6 +179,7 @@ function LocalVFS:open(filename, mode, options)
         handle = handle,
         path = full_path,
         lock_path = needs_lock and lock_path or nil,
+        lock_handle = lock_handle,
         vfs = self
     }, {
         __gc = function(t)
@@ -164,6 +232,10 @@ function LocalVFS:open(filename, mode, options)
             self.handle:close()
             self.handle = nil
         end
+        if self.lock_handle then
+            self.lock_handle:close()
+            self.lock_handle = nil
+        end
         if self.lock_path then
             LocalVFS._active_locks[self.path] = nil
             os.remove(self.lock_path)
@@ -188,6 +260,11 @@ end
 function LocalVFS:delete(filename)
     local full_path = self.base_dir .. "/" .. filename
     if LocalVFS._active_locks[full_path] then
+        local obj = LocalVFS._active_locks[full_path]
+        if obj.lock_handle then
+            obj.lock_handle:close()
+            obj.lock_handle = nil
+        end
         LocalVFS._active_locks[full_path] = nil
     end
     os.remove(full_path .. ".lock")

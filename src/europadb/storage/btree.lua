@@ -1,4 +1,4 @@
-local page_mgr = require("luadb.storage.page")
+local page_mgr = require("europadb.storage.page")
 
 local BTree = {}
 BTree.__index = BTree
