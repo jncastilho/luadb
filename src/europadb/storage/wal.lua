@@ -1,4 +1,4 @@
-local serializer = require("luadb.storage.serializer")
+local serializer = require("europadb.storage.serializer")
 
 local WAL = {}
 WAL.__index = WAL

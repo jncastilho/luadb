@@ -1,4 +1,4 @@
-local aws_sigv4 = require("luadb.vfs.aws_sigv4")
+local aws_sigv4 = require("europadb.vfs.aws_sigv4")
 
 local S3VFS = {}
 S3VFS.__index = S3VFS

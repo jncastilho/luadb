@@ -1,6 +1,6 @@
-local page_mgr = require("luadb.storage.page")
-local serializer = require("luadb.storage.serializer")
-local BTree = require("luadb.storage.btree")
+local page_mgr = require("europadb.storage.page")
+local serializer = require("europadb.storage.serializer")
+local BTree = require("europadb.storage.btree")
 
 local executor = {}
 executor.__index = executor
@@ -1027,7 +1027,7 @@ function executor:execute(ast)
             else
                 for _, proj in ipairs(ast.projections) do
                     if proj.type == "JSON_EXTRACT" then
-                        local json = require("luadb.sql.json")
+                        local json = require("europadb.sql.json")
                         local raw_json = nil
                         for idx, col in ipairs(meta.columns) do
                             if col.name:lower() == proj.column:lower() then
@@ -1255,7 +1255,7 @@ function executor:_eval_where(where, row, columns)
     if where.op then
         local val = nil
         if type(where.left) == "table" and where.left.type == "JSON_EXTRACT" then
-            local json = require("luadb.sql.json")
+            local json = require("europadb.sql.json")
             local raw_json = nil
             if columns then
                 for idx, col in ipairs(columns) do

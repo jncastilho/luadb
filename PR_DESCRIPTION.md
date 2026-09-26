@@ -1,10 +1,12 @@
-# Pull Request: fix(storage,wal,parser): on-disk WAL crash recovery, freelist space reclamation, process locking, QA hardening & 100% ClickHouse parity
+# Pull Request: feat(europadb): rebrand to EuropaDB, O(1) WAL indexing, POSIX locking, freelist packing & multi-oracle conformance
 
 ## Summary
 
-This pull request resolves fundamental storage engine, durability, locking, and query execution gaps, transitioning LuaDB from an educational prototype into an ACID-resilient embedded database with zero physical space leaks, comprehensive static analysis hardening, and 100% relational conformance across all supported SQL engines.
+This pull request resolves fundamental storage engine, durability, locking, and query execution gaps, transitioning the engine into **EuropaDB** (v2.0.0-europa) — an ultra-lightweight, crash-resilient embedded database with zero physical space leaks, comprehensive static analysis hardening, and 100% relational conformance across all supported SQL engines.
 
-All 22 automated test suites pass cleanly, achieving 100% byte-identical output across SQLite 3, DuckDB, and ClickHouse Local (219/219 test cases).
+Named after *Europa*, one of the Galilean moons orbiting Jupiter. In Portuguese (the birthplace of Lua at PUC-Rio in Brazil), the word for Moon is literally *"Lua"*, making EuropaDB both an homage to its heritage and a planetary symbol of an impenetrable icy shell (binary WAL durability) harboring a deep relational ocean beneath.
+
+All 22 automated test suites pass cleanly, achieving 100% byte-identical output across SQLite 3, DuckDB, and ClickHouse Local (219/219 test cases). Backward compatibility is 100% preserved via transparent module aliasing (`require("luadb") -> require("europadb")`).
 
 ---
 

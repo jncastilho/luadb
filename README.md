@@ -1,8 +1,10 @@
-# LuaDB
+# EuropaDB
 
-**LuaDB** is a lightweight, embeddable, zero-dependency Relational Database Management System (RDBMS) written **100% from scratch in pure Lua** (compatible with Lua 5.1+, 5.4, 5.5, and LuaJIT).
+**EuropaDB** (formerly LuaDB) is an ultra-lightweight, embeddable, crash-resilient zero-dependency Relational Database Management System (RDBMS) written **100% from scratch in pure Lua** (compatible with Lua 5.1+, 5.4, 5.5, and LuaJIT).
 
-It provides full SQL execution, Write-Ahead Logging (WAL) for ACID transactions, a B+Tree indexing engine, a pluggable Virtual File System (VFS) layer (**Local Disk**, **In-Memory RAM**, and **Amazon S3 Object Storage** with AWS SigV4 authentication), a **Native JSON/JSONB Engine**, a **PostgreSQL Wire Protocol Gateway**, **Multi-Region Master-Master Active-Active Cluster Replication** with **Hybrid Logical Clock (HLC) conflict resolution**, **`ALTER TABLE` Schema Migrations**, **Foreign Key `ON DELETE CASCADE` Constraints**, **Common Table Expressions (`WITH` CTEs)**, and an independent **Dark Room conformance test harness** that validates SQL correctness against SQLite 3 as an external oracle.
+> **The Naming Heritage**: Named after *Europa*, one of the Galilean moons orbiting Jupiter. In Portuguese (the native birthplace of Lua at PUC-Rio in Brazil), the word for Moon is literally *"Lua"*, making EuropaDB both an homage to its Lua heritage and a planetary symbol of an impenetrable icy shell (binary WAL durability) harboring a deep relational ocean beneath.
+
+It provides full SQL execution, on-disk Write-Ahead Logging (WAL) with Adler-32 checksums for ACID crash resilience, a B+Tree indexing engine, a pluggable Virtual File System (VFS) layer (**Local Disk**, **In-Memory RAM**, and **Amazon S3 Object Storage** with AWS SigV4 authentication), a **Native JSON/JSONB Engine**, a **PostgreSQL Wire Protocol Gateway**, **Multi-Region Master-Master Active-Active Cluster Replication** with **Hybrid Logical Clock (HLC) conflict resolution**, **`ALTER TABLE` Schema Migrations**, **Foreign Key `ON DELETE CASCADE` Constraints**, **Common Table Expressions (`WITH` CTEs)**, and an independent **Dark Room conformance test harness** that validates SQL correctness against SQLite 3, DuckDB, and ClickHouse Local as external oracles.
 
 ---
 
@@ -14,9 +16,9 @@ It provides full SQL execution, Write-Ahead Logging (WAL) for ACID transactions,
 2. **Serverless & Edge Lua Environments (OpenResty, Nginx, Cloudflare Workers)**:
    - High-speed transient state management and API caching without native C-binding nightmares.
 3. **Embedded Systems & IoT**:
-   - Tiny footprint (~300 KB Lua memory consumption) for resource-constrained embedded Linux boards.
+   - Tiny footprint (~500 KB Lua memory consumption) for resource-constrained embedded Linux boards.
 4. **Telecom & CDR Processing (Kamailio, Asterisk)**:
-   - SIP Call Detail Record local buffering with Kafka failover drain (see `examples/05_kamailio_cdr_drain.lua`).
+   - SIP Call Detail Record local buffering with Kafka failover drain via decoupled shared-memory ingestion (see `examples/05_kamailio_cdr_drain.lua`).
 
 ---
 
@@ -27,9 +29,10 @@ It provides full SQL execution, Write-Ahead Logging (WAL) for ACID transactions,
 | **Core Storage Engine (B+Tree, WAL, Page Manager)** | 100% Pure Lua (Zero C Dependencies) | 100% Pure Lua |
 | **SQL Parser, Lexer & Query Executor** | 100% Pure Lua | 100% Pure Lua |
 | **VFS Storage Layer (Local, RAM, Amazon S3)** | 100% Pure Lua (Pure Lua HMAC-SHA256 SigV4) | 100% Pure Lua |
-| **PostgreSQL Wire Gateway (`bin/luadb_server.lua`)** | N/A (Requires FFI POSIX Sockets) | Supported via LuaJIT FFI Sockets |
+| **Multi-Process Locking (`local_vfs.lua`)** | Advisory lockfile with PID validation | Kernel `flock` via FFI with `busy_timeout` |
+| **PostgreSQL Wire Gateway (`bin/europadb_server.lua`)** | N/A (Requires FFI POSIX Sockets) | Supported via LuaJIT FFI Sockets |
 
-> **Runtime Transparency**: The entire database engine (storage, B+Tree, WAL, SQL engine, VFS, JSON, and CLI) runs on standard, un-extended PUC-Rio Lua 5.1+. Only the optional standalone network gateway server (`bin/luadb_server.lua`) uses LuaJIT FFI for non-blocking socket I/O.
+> **Runtime Transparency**: The entire database engine (storage, B+Tree, WAL, SQL engine, VFS, JSON, and CLI) runs on standard, un-extended PUC-Rio Lua 5.1+. Only the optional standalone network gateway server (`bin/europadb_server.lua`) uses LuaJIT FFI for non-blocking socket I/O.
 
 ---
 
@@ -37,9 +40,9 @@ It provides full SQL execution, Write-Ahead Logging (WAL) for ACID transactions,
 
 Run the built-in performance benchmark suite: `lua tests/benchmark_spec.lua`
 
-- **Write Throughput (INSERT TPS)**: ~1,750+ Transactions Per Second (batch WAL commit).
-- **Point Query Latency**: < 2.2 ms for index and table range queries.
-- **Active Memory Footprint**: ~295 KB Lua memory consumption under active query load.
+- **Write Throughput (INSERT TPS)**: ~2,600+ Transactions Per Second (batch WAL commit).
+- **Point Query Latency**: < 2.3 ms for index and table range queries.
+- **Active Memory Footprint**: ~550 KB Lua memory consumption under active query load.
 
 ---
 
@@ -90,12 +93,12 @@ git clone https://github.com/jncastilho/luadb.git
 
 ### Embedded Usage
 ```lua
-local luadb = require("luadb")
+local europadb = require("europadb") -- or require("luadb") for backward compatibility
 
--- Open database handle
-local db = luadb.open({
+-- Open database handle (.edb = Europa DataBase)
+local db = europadb.open({
     driver = "local",
-    storage_path = "app.db"
+    storage_path = "app.edb"
 })
 
 -- Create schema with Foreign Key constraints
@@ -168,32 +171,32 @@ db:close()
 
 ## Interfaces & Server Modes
 
-### 1. Interactive CLI (`bin/luadb_cli.lua`)
+### 1. Interactive CLI (`bin/europadb_cli.lua`)
 Run the interactive SQL console:
 ```bash
-lua bin/luadb_cli.lua mydata.db
+lua bin/europadb_cli.lua mydata.edb
 ```
 ```text
-luadb=> CREATE TABLE demo (id INT PRIMARY KEY, title TEXT);
-luadb=> INSERT INTO demo VALUES (1, 'Hello World');
-luadb=> SELECT * FROM demo;
+europa=> CREATE TABLE demo (id INT PRIMARY KEY, title TEXT);
+europa=> INSERT INTO demo VALUES (1, 'Hello World');
+europa=> SELECT * FROM demo;
 +----+-------------+
 | id | title       |
 +----+-------------+
 | 1  | Hello World |
 +----+-------------+
-luadb=> \dt
-luadb=> \q
+europa=> \dt
+europa=> \q
 ```
 
-### 2. Standalone PostgreSQL Wire Server (`bin/luadb_server.lua`)
+### 2. Standalone PostgreSQL Wire Server (`bin/europadb_server.lua`)
 Start the network database server listening on port 5433:
 ```bash
-luajit bin/luadb_server.lua mydata.db 5433
+luajit bin/europadb_server.lua mydata.edb 5433
 ```
 Connect using standard `psql`:
 ```bash
-psql -h 127.0.0.1 -p 5433 -U postgres -d luadb
+psql -h 127.0.0.1 -p 5433 -U postgres -d europadb
 ```
 
 ---

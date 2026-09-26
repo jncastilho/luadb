@@ -1,8 +1,8 @@
 local ffi_ok, ffi = pcall(require, "ffi")
 local bit = ffi_ok and require("bit")
-local config = require("luadb.cluster.config")
-local proto = require("luadb.cluster.proto")
-local ConflictResolver = require("luadb.cluster.conflict")
+local config = require("europadb.cluster.config")
+local proto = require("europadb.cluster.proto")
+local ConflictResolver = require("europadb.cluster.conflict")
 
 local replicator = {}
 replicator.__index = replicator
@@ -161,7 +161,7 @@ function replicator:persist_state()
         local in_tx = self.db.wal and self.db.wal.in_transaction
         if not in_tx then self.db:exec("BEGIN TRANSACTION;") end
         self.db:exec("CREATE TABLE IF NOT EXISTS _luadb_conflict_state (k TEXT PRIMARY KEY, v TEXT);")
-        local json = require("luadb.sql.json")
+        local json = require("europadb.sql.json")
         local state = self.conflict_resolver:export_state()
         local jstr = json.stringify(state)
         local escaped = jstr:gsub("'", "''")
@@ -178,7 +178,7 @@ function replicator:load_persistent_state()
     pcall(function()
         local rows = self.db:exec("SELECT v FROM _luadb_conflict_state WHERE k = 'state';")
         if rows and rows[1] and rows[1].v then
-            local json = require("luadb.sql.json")
+            local json = require("europadb.sql.json")
             local state = json.parse(rows[1].v)
             if state then
                 self.conflict_resolver:import_state(state)
